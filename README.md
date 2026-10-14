@@ -9,6 +9,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows_x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![Graphics](https://img.shields.io/badge/Graphics-Direct3D_12-107C10?style=for-the-badge)
 [![Game data](https://img.shields.io/badge/Game_files-Not_included-EF4444?style=for-the-badge)](#supported-version)
+[![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white)](https://ko-fi.com/post/FORZA-MOTORSPORT-3-en-PC-SIN-EMULADOR-Port-Z8W528T56H)
 
 [Download 0.1.0](../../releases/tag/0.1.0) · [Supported version](#supported-version) · [Launcher](#launcher) · [Build from source](#building-from-source) · [Porting notes](#porting-notes)
 
