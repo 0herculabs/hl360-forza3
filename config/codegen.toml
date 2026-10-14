@@ -1,0 +1,39 @@
+# Codegen overrides for Forza Motorsport 3 (default.xex, title 4D53084D, v0.0.0.8).
+# Included from fm3_manifest.toml.
+
+# CRT setjmp/longjmp (used by libjpeg's error handling, among others). Without
+# these the guest longjmp restores registers but never unwinds the host stack,
+# leaving the caller running with clobbered non-volatile registers.
+setjmp_address = 0x82534B20
+longjmp_address = 0x825345E0
+
+[functions]
+# Tail-call targets only reached through vtables / adjustor thunks.
+0x82576940 = { size = 0x4C }   # interlocked release (refcount at +0x110)
+0x82B123E0 = { size = 0x04 }   # thunk -> 0x82B12068
+0x826E0998 = { size = 0x18 }   # adjustor thunk -> 0x826E0F70
+0x82A60EF0 = { size = 0x28 }
+0x82713848 = { size = 0x18 }   # thunk -> 0x82713668
+0x82AB2668 = { size = 0x18 }   # thunk -> 0x82AB2468
+0x82A07F68 = { size = 0x4C }
+0x82A97418 = { size = 0x24 }   # interlocked add-ref (+0x174)
+0x828DCE98 = { size = 0x08 }   # adjustor thunk -> 0x828DCDF8
+0x8254ABF0 = { size = 0x24 }   # interlocked add-ref (+0xE0)
+0x82B14310 = { size = 0x08 }   # adjustor thunk -> 0x82B0DAC8
+
+# Property getters/setters with a tail-merged "li r3,0; blr" exit that the
+# scanner split at the first blr.
+0x8295AB20 = { end = 0x8295ABA0 }
+0x82971FE0 = { end = 0x82972054 }
+0x829720D8 = { end = 0x8297214C }
+
+# XAPI SwitchToFiber (hand-written asm, only reached by tail call); see [rexcrt].
+0x82A82210 = { end = 0x82A8261C }
+
+# XAPI fibers: replaced by the SDK's native host-fiber implementation.
+[rexcrt]
+ConvertThreadToFiber = 0x82A7B098
+ConvertFiberToThread = 0x82A7B128
+CreateFiber = 0x82A7B178
+DeleteFiber = 0x82A7B258
+SwitchToFiber = 0x82A82210

@@ -1,0 +1,39 @@
+# Port settings for Forza Motorsport 3, shipped next to fm3.exe.
+# The launcher writes the player's choices to fm3.user.toml, which the game
+# loads after this file, so those win.
+
+gpu_backend = "d3d12"
+
+# FM3 submits audio in blocks of 256 samples at 48 kHz (5.33 ms each). The
+# SDK default of 8 blocks only leaves about 43 ms of scheduling margin; shader
+# compilation and GPU readbacks can occasionally exhaust it, producing a
+# discontinuity when SDL inserts silence. Keep a larger per-game queue (about
+# 85 ms) to absorb those stalls without returning to the SDK's old 64-block
+# latency.
+audio_maxqframes = 16
+
+# Not the host's vertical sync: in the SDK this is the guest vblank timer. On,
+# the console's 60 Hz vblank; off, one every millisecond - FM3 paces itself on
+# vblanks and runs too fast. The launcher does not offer it.
+vsync = true
+
+# Road textures and car thumbnails need the GPU's render-to-texture results on
+# the CPU (xenia-canary compatibility #409). "full" is the most accurate but
+# synchronous: it stalls every frame and locks FM3 at 30 fps (measured, even at
+# 1x); "fast" reads the previous frame's copy asynchronously and holds 60 fps.
+readback_resolve = "fast"
+
+# Asynchronous pipeline compilation skips draws (untextured placeholders,
+# missing frames) until each pipeline is ready; compile synchronously.
+async_shader_compilation = false
+
+# Engines routinely issue fetches the strict path rejects.
+gpu_allow_invalid_fetch_constants = true
+
+# xenia-edge's (and Xenia's original) default; the SDK turned it off. Runs the
+# vertex shader of unclipped draws (clears, full-screen passes) on the CPU to
+# bound the EDRAM they touch; without it up to the whole EDRAM counts as used,
+# with spurious ownership transfers that can overwrite other render targets
+# (suspected cause of FM3's square shadows).
+execute_unclipped_draw_vs_on_cpu = true
+
