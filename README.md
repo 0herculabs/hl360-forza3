@@ -1,4 +1,17 @@
+<div align="center">
+
 # Forza Motorsport 3 — Native PC Recompilation
+
+**A work-in-progress static recompilation of the Xbox 360 racing game for modern Windows PCs.**
+
+![Status](https://img.shields.io/badge/Status-Work_in_progress-F59E0B?style=for-the-badge)
+![Platform](https://img.shields.io/badge/Platform-Windows_x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)
+![Graphics](https://img.shields.io/badge/Graphics-Direct3D_12-107C10?style=for-the-badge)
+[![Game data](https://img.shields.io/badge/Game_files-Not_included-EF4444?style=for-the-badge)](#supported-version)
+
+[Supported version](#supported-version) · [Launcher](#launcher) · [Build from source](#building-from-source) · [Porting notes](#porting-notes)
+
+</div>
 
 A work-in-progress static recompilation of *Forza Motorsport 3: Ultimate Collection* that runs natively on Windows PCs. The Xbox 360 PowerPC code is translated to C++ using the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), while the runtime provides the console services required by the game, including graphics, audio, input, profiles, file-system access, and downloadable content.
 
