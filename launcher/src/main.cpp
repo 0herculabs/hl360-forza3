@@ -253,8 +253,6 @@ struct App {
   std::string plus_update_zip;
   PlusMode plus_mode = PlusMode::kNormal;
   bool plus_harder_ai = false;
-  std::vector<std::string> skip_intro_saves;
-  int skip_intro_index = 0;
   bool fov_ok = false;
   PlusFov fov;
   PlusFov fov_original;
@@ -352,8 +350,6 @@ struct App {
       }
     }
     if (plus.installed) plus_mode = plus.mode, plus_harder_ai = plus.harder_ai;
-    skip_intro_saves = plus.installed ? ListSkipIntroSaves(dir, plus.mode) : std::vector<std::string>{};
-    skip_intro_index = std::clamp(skip_intro_index, 0, std::max(0, int(skip_intro_saves.size()) - 1));
     fov_ok = ReadPlusFov(dir, false, fov) && ReadPlusFov(dir, true, fov_original);
     if (!fs::exists(dir / "default.xex", ec)) {
       game_state = GameState::kMissing;
@@ -1201,14 +1197,7 @@ std::vector<std::pair<PlusMode, const char*>> PlusModes() {
 }
 
 void CardPlusMod(App& app) {
-  BeginCard("##plus", "Project Forza Plus 3",
-            L("Community mod: real turbos and superchargers, FM4 tyre physics, a new PI system, fuel and tyre "
-              "wear, engine and drivetrain swaps, every car and wheel purchasable, four career modes and the "
-              "DLC packs. Installed from its .zip files; the original files are kept, so it can be removed.",
-              "Mod de la comunidad: turbos y compresores reales, física de neumáticos de FM4, nuevo sistema de "
-              "PI, consumo y desgaste, cambios de motor y tracción, todos los coches y llantas a la venta, cuatro "
-              "modos de trayectoria y los packs de DLC. Se instala desde sus .zip y guarda los originales, así "
-              "que se puede quitar."));
+  BeginCard("##plus", "Project Forza Plus 3");
   const auto file_button = [](const std::string& path, const char* id) {
     const std::string label =
         (path.empty() ? std::string(L("Choose .zip", "Elegir .zip")) : fs::u8path(path).filename().u8string()) + id;
@@ -1220,9 +1209,9 @@ void CardPlusMod(App& app) {
   } else if (!app.plus.installed) {
     ImGui::BeginDisabled(app.TaskRunning() || app.game);
     if (BeginRows("##plus_new")) {
-      Row(L("Mod archive", "Archivo del mod"), "Project Forza Plus 3 v1.3.zip");
+      Row(L("Mod archive", "Archivo del mod"));
       if (file_button(app.plus_base_zip, "##plus_base")) PickZip(app, &App::picked_plus_base);
-      Row(L("Update (optional)", "Actualización (opcional)"), "Project Forza Plus 3 Update v1.3.zip");
+      Row(L("Update (optional)", "Actualización (opcional)"));
       if (file_button(app.plus_update_zip, "##plus_update")) PickZip(app, &App::picked_plus_update);
       Row(L("Career mode", "Modo de trayectoria"));
       Segmented<PlusMode>("plus_mode", app.plus_mode, PlusModes());
@@ -1230,10 +1219,6 @@ void CardPlusMod(App& app) {
       Toggle("##plus_ai", &app.plus_harder_ai);
       EndRows();
     }
-    TextDim(L("About 10 GB are extracted. The Ultimate Collection's content packs are set aside while the mod "
-              "is installed (it brings its own versions).",
-              "Se extraen unos 10 GB. Los packs de contenido de la Ultimate Collection se apartan mientras el mod "
-              "esté instalado (trae sus propias versiones)."));
     ImGui::BeginDisabled(app.plus_base_zip.empty());
     if (PrimaryButton(L("Install FM3 Plus", "Instalar FM3 Plus"), ImVec2(S(260), S(40)))) {
       const fs::path game_dir = app.GameDir(), user_dir = app.UserDir();
@@ -1256,13 +1241,12 @@ void CardPlusMod(App& app) {
     bool harder_ai = app.plus.harder_ai;
     bool changed = false;
     if (BeginRows("##plus_set")) {
-      Row(L("Career mode", "Modo de trayectoria"),
-          L("The mod suggests a separate profile for each mode.", "El mod recomienda un perfil distinto para cada modo."));
+      Row(L("Career mode", "Modo de trayectoria"));
       changed |= Segmented<PlusMode>("plus_mode", mode, PlusModes());
       Row(L("Harder AI", "IA más difícil"));
       changed |= Toggle("##plus_ai", &harder_ai);
       if (!app.plus.updated) {
-        Row(L("Update", "Actualización"), "Project Forza Plus 3 Update v1.3.zip");
+        Row(L("Update", "Actualización"));
         if (file_button(app.plus_update_zip, "##plus_update")) PickZip(app, &App::picked_plus_update);
         if (!app.plus_update_zip.empty()) {
           ImGui::SameLine();
@@ -1291,45 +1275,8 @@ void CardPlusMod(App& app) {
   EndCard();
 }
 
-void CardSkipIntro(App& app) {
-  if (!app.plus.installed) return;
-  BeginCard("##skipintro", L("Quick start", "Inicio rápido"),
-            L("The mod's \"Skip Intro\" saves: start a career with the chosen car and some credits, skipping the "
-              "first race. Replaces the active profile's career (the current one is moved aside, not deleted).",
-              "Las partidas \"Skip Intro\" del mod: empiezas la trayectoria con el coche elegido y algo de dinero, "
-              "sin la primera carrera. Sustituye la trayectoria del perfil activo (la actual se aparta, no se borra)."));
-  if (app.skip_intro_saves.empty()) {
-    TextDim(L("This career mode has no Skip Intro saves.", "Este modo de trayectoria no tiene partidas Skip Intro."));
-    EndCard();
-    return;
-  }
-  const Profile* profile = app.ActiveProfile();
-  ImGui::BeginDisabled(app.TaskRunning() || app.game || !profile);
-  if (BeginRows("##si")) {
-    Row(L("Starter car", "Coche inicial"));
-    std::vector<std::pair<int, const char*>> items;
-    for (int i = 0; i < int(app.skip_intro_saves.size()); ++i) items.emplace_back(i, app.skip_intro_saves[i].c_str());
-    Combo<int>("##si_car", app.skip_intro_index, items);
-    EndRows();
-  }
-  const std::string label = std::string(L("Use for profile ", "Usar en el perfil ")) + (profile ? profile->name : "");
-  if (ImGui::Button(label.c_str()) && profile) {
-    const std::string error = ApplySkipIntroSave(app.GameDir(), app.UserDir(), app.plus.mode,
-                                                 app.skip_intro_saves[app.skip_intro_index], profile->xuid);
-    app.notice = error.empty() ? std::string(L("Quick-start save copied to ", "Partida de inicio rápido copiada a ")) +
-                                     profile->name
-                               : error;
-  }
-  ImGui::EndDisabled();
-  EndCard();
-}
-
 void CardFov(App& app) {
-  BeginCard("##fov", L("Field of view", "Campo de visión"),
-            L("Camera angle in degrees for each view: under 100 mph, 100-150 mph and over 150 mph. Takes effect "
-              "the next time the game starts. The cockpit view cannot be changed.",
-              "Ángulo de la cámara en grados para cada vista: a menos de 160 km/h, entre 160 y 240 km/h y a más "
-              "de 240 km/h. Se aplica la próxima vez que arranques el juego. La vista interior no se puede cambiar."));
+  BeginCard("##fov", L("Field of view", "Campo de visión"));
   if (!app.fov_ok) {
     TextDim(L("Media/Camera/CameraSettings.ini is missing: install the game first.",
               "Falta Media/Camera/CameraSettings.ini: instala antes el juego."));
@@ -1342,10 +1289,7 @@ void CardFov(App& app) {
   ImGui::BeginDisabled(app.TaskRunning() || app.game);
   if (BeginRows("##fov_rows")) {
     for (int c = 0; c < kCameraCount; ++c) {
-      const int* o = app.fov_original.degrees[c];
-      char hint[64];
-      std::snprintf(hint, sizeof(hint), "%s %d / %d / %d", L("Original:", "Original:"), o[0], o[1], o[2]);
-      Row(names[c], hint);
+      Row(names[c]);
       ImGui::PushID(c);
       ImGui::SliderInt3("##fov", app.fov.degrees[c], 30, 110);
       commit |= ImGui::IsItemDeactivatedAfterEdit();
@@ -1369,7 +1313,6 @@ void CardFov(App& app) {
 void TabPlus(App& app) {
   CardTask(app);
   CardPlusMod(app);
-  CardSkipIntro(app);
   CardFov(app);
 }
 
@@ -1486,11 +1429,7 @@ void TabInstall(App& app) {
   }
   WizardStep(app, 2, L("Step 2 · Disc 2 (Content Install Disc)", "Paso 2 · Disco 2 (Content Install Disc)"),
              app.plus.installed
-                 ? L("FM3 Plus replaces the eight Ultimate Collection packs with its own modified content set. "
-                     "The original packs are kept and return when the mod is removed.",
-                     "FM3 Plus sustituye los ocho packs de Ultimate Collection por su propio conjunto modificado. "
-                     "Los originales se conservan y vuelven al quitar el mod.")
-                 : L("The cars and tracks of the Ultimate Collection (8 packs, about 3.4 GB). Without them the game "
+                 ? "" : L("The cars and tracks of the Ultimate Collection (8 packs, about 3.4 GB). Without them the game "
                      "warns that Disc 2 content is not installed.",
                      "Los coches y circuitos de la Ultimate Collection (8 packs, unos 3,4 GB). Sin ellos el juego "
                      "avisa de que falta el contenido del Disco 2."),

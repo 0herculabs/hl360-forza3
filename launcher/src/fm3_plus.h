@@ -59,14 +59,6 @@ bool UninstallPlus(const std::filesystem::path& game_dir, const std::filesystem:
 std::string SetPlusMode(const std::filesystem::path& game_dir, const std::filesystem::path& user_dir,
                         PlusMode mode, bool harder_ai);
 
-// "Skip Intro" saves of a mode: a starter car and some credits, skipping the
-// first race. Names as in the mod ("Golf GTI", "Civic Type R"...).
-std::vector<std::string> ListSkipIntroSaves(const std::filesystem::path& game_dir, PlusMode mode);
-// Copies one into the profile's save folder (<user>/<xuid>/4D53084D/00000001),
-// moving the current career aside. Returns an error message, or empty.
-std::string ApplySkipIntroSave(const std::filesystem::path& game_dir, const std::filesystem::path& user_dir,
-                               PlusMode mode, const std::string& save, const std::string& xuid);
-
 // Field of view of the four driving cameras in Media/Camera/CameraSettings.ini,
 // in degrees per speed band: [0] under 100 mph, [1] 100-150 mph, [2] above.
 enum PlusCamera { kChaseNear, kChaseFar, kHood, kBumper, kCameraCount };

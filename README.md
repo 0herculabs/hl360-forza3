@@ -59,7 +59,7 @@ The launcher is based on the one created for the Forza Motorsport 2 recompilatio
 - **Graphics:** windowed or fullscreen mode, monitor selection, window size, 16:9 output, 720p/1440p/4K presets, 1×–4× internal resolution, anisotropic filtering, FXAA, and Bilinear, AMD CAS, or AMD FSR scaling.
 - **Controls:** Xbox and other SDL/XInput-compatible controllers, remappable keyboard controls, and optional mouse input mapped to the right stick.
 - **Language and audio:** select the in-game language or mute game audio.
-- **Project Forza Plus 3:** install, update, configure, and remove the mod from its ZIP archives. Available options include Career mode selection, harder AI, quick-start saves, and field of view.
+- **Project Forza Plus 3:** install, update, configure, and remove the mod from its ZIP archives. Available options include Career mode selection, harder AI, and field of view.
 - **Shader precompilation:** prepares graphics pipelines before play to reduce first-time stutter.
 
 Direct3D 12 and `readback_resolve = "fast"` are selected automatically. FM3 requires render readback for the road surface and vehicle thumbnails, while the synchronous `full` mode limits the game to 30 FPS. These settings are therefore not exposed in the launcher.

@@ -516,49 +516,6 @@ std::string SetPlusMode(const fs::path& game_dir, const fs::path& user_dir, Plus
   return {};
 }
 
-std::vector<std::string> ListSkipIntroSaves(const fs::path& game_dir, PlusMode mode) {
-  std::vector<std::string> out;
-  std::error_code ec;
-  // "Skip Intro Saves" (one per starter car), or "Skip Intro Save" in Sandbox.
-  for (const char* folder : {"Skip Intro Saves", "Skip Intro Save"}) {
-    const fs::path dir = ModeDir(game_dir, mode) / folder;
-    if (fs::exists(dir / "ForzaProfile", ec)) out.push_back(folder);
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
-      if (!fs::exists(entry.path() / "ForzaProfile", ec)) continue;
-      std::string name = entry.path().filename().u8string();
-      if (name.rfind("Skip Intro ", 0) == 0) name = name.substr(11);
-      out.push_back(name);
-    }
-  }
-  std::sort(out.begin(), out.end());
-  return out;
-}
-
-std::string ApplySkipIntroSave(const fs::path& game_dir, const fs::path& user_dir, PlusMode mode,
-                               const std::string& save, const std::string& xuid) {
-  if (!LoadPlus(game_dir).installed) return Missing();
-  std::error_code ec;
-  fs::path source;
-  for (const char* folder : {"Skip Intro Saves", "Skip Intro Save"}) {
-    const fs::path dir = ModeDir(game_dir, mode) / folder;
-    if (save == folder && fs::exists(dir / "ForzaProfile", ec)) source = dir / "ForzaProfile";
-    if (fs::exists(dir / fs::u8path("Skip Intro " + save) / "ForzaProfile", ec)) {
-      source = dir / fs::u8path("Skip Intro " + save) / "ForzaProfile";
-    }
-  }
-  if (source.empty()) return L("That save is not in the mod.", "Esa partida no está en el mod.");
-  const fs::path saves = user_dir / fs::u8path(xuid) / "4D53084D" / "00000001";
-  const fs::path target = saves / "ForzaProfile";
-  if (fs::exists(target, ec)) {
-    const fs::path aside = saves / fs::u8path("ForzaProfile.before-skip-intro-" + std::to_string(std::time(nullptr)));
-    fs::rename(target, aside, ec);
-    if (ec) return L("Could not set the current career aside.", "No se pudo apartar la trayectoria actual.");
-  }
-  fs::create_directories(target, ec);
-  if (!CopyTree(source, target)) return L("Could not copy the save.", "No se pudo copiar la partida.");
-  return {};
-}
-
 namespace {
 
 constexpr char kCameraFile[] = "Media/Camera/CameraSettings.ini";
