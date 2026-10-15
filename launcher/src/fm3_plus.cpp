@@ -13,6 +13,7 @@
 
 #include "i18n.h"
 #include "miniz.h"
+#include "safe_path.h"
 
 namespace launcher {
 namespace fs = std::filesystem;
@@ -100,7 +101,7 @@ struct Copy {
 
 // Adds every file under `<root><from>` to the plan as `<to><rest>`. Keyed
 // case-insensitively, so the update archive overrides the base one.
-void Plan(Zip& zip, const std::string& root, const std::string& from, const std::string& to,
+bool Plan(Zip& zip, const std::string& root, const std::string& from, const std::string& to,
           std::map<std::string, Copy>& plan) {
   const std::string prefix = root + from;
   mz_zip_archive_file_stat stat;
@@ -108,9 +109,11 @@ void Plan(Zip& zip, const std::string& root, const std::string& from, const std:
     if (!zip.Stat(i, stat) || stat.m_is_directory) continue;
     const std::string name = stat.m_filename;
     if (Lower(name).rfind(Lower(prefix), 0) != 0) continue;
+    if (!IsSafeRelativePath(name.substr(prefix.size()))) return false;
     const std::string dest = to + name.substr(prefix.size());
     plan[Lower(dest)] = {&zip, i, dest, stat.m_uncomp_size};
   }
+  return true;
 }
 
 // The folder that holds `folder` inside the archive ("Project Forza Plus 3/"
@@ -150,6 +153,14 @@ void RemoveEmptyDirs(fs::path dir, const fs::path& stop) {
 bool Restore(const fs::path& game_dir, const fs::path& user_dir, const PlusState& state, TaskProgress& progress) {
   std::error_code ec;
   bool ok = true;
+  for (const auto* paths : {&state.replaced, &state.added, &state.dlc_added, &state.dlc_moved}) {
+    for (const auto& p : *paths) {
+      if (!IsSafeRelativePath(p)) {
+        progress.SetStatus(L("Unsafe mod state path; backups preserved.", "Ruta insegura en el estado del mod; copias conservadas."));
+        return false;
+      }
+    }
+  }
   for (const auto& p : state.replaced) {
     fs::copy_file(game_dir / kModDir / "backup" / fs::u8path(p), game_dir / fs::u8path(p),
                   fs::copy_options::overwrite_existing, ec);
@@ -161,10 +172,14 @@ bool Restore(const fs::path& game_dir, const fs::path& user_dir, const PlusState
   for (const auto& p : state.added) {
     const fs::path file = game_dir / fs::u8path(p);
     fs::remove(file, ec);
+    if (ec) ok = false;
     RemoveEmptyDirs(file.parent_path(), game_dir / "Media");
   }
   const fs::path dlc = DlcDir(user_dir);
-  for (const auto& p : state.dlc_added) fs::remove_all(dlc / fs::u8path(p), ec);
+  for (const auto& p : state.dlc_added) {
+    fs::remove_all(dlc / fs::u8path(p), ec);
+    if (ec) ok = false;
+  }
   for (const auto& p : state.dlc_moved) {
     fs::rename(user_dir / kModDir / "dlc" / fs::u8path(p), dlc / fs::u8path(p), ec);
     if (ec) {
@@ -228,10 +243,6 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
     progress.SetStatus(L("Install the game first (Install tab).", "Instala antes el juego (pestaña Instalación)."));
     return false;
   }
-  if (LoadPlus(game_dir).installed && !UninstallPlus(game_dir, user_dir, progress)) return false;
-  // The mod brings its own track settings (shadows hidden among them).
-  if (AreShadowsHidden(game_dir)) SetShadowsHidden(game_dir, false);
-
   Zip base(base_zip);
   std::unique_ptr<Zip> update;
   if (!update_zip.empty()) update = std::make_unique<Zip>(update_zip);
@@ -247,9 +258,9 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
   }
   std::map<std::string, Copy> plan;
   // Its default.xex (the 2009 release, edited) is not used: see fm3_plus.h.
-  Plan(base, *root, "Main Game Changes/Media/", "Media/", plan);
-  Plan(base, *root, "Game Mode DBs/", std::string(kModDir) + "/modes/", plan);
-  Plan(base, *root, "Disc 2 and DLCs/00000002/", kDlcPrefix, plan);
+  if (!Plan(base, *root, "Main Game Changes/Media/", "Media/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
+  if (!Plan(base, *root, "Game Mode DBs/", std::string(kModDir) + "/modes/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
+  if (!Plan(base, *root, "Disc 2 and DLCs/00000002/", kDlcPrefix, plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
   if (update) {
     const auto update_root = FindRoot(*update, "Update Files/");
     if (!update_root) {
@@ -257,8 +268,8 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
                            "No es la actualización de Project Forza Plus 3 (falta la carpeta \"Update Files\")."));
       return false;
     }
-    Plan(*update, *update_root, "Update Files/Game Mode DBs/", std::string(kModDir) + "/modes/", plan);
-    Plan(*update, *update_root, "Update Files/Physics/", "Media/Physics/", plan);
+    if (!Plan(*update, *update_root, "Update Files/Game Mode DBs/", std::string(kModDir) + "/modes/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
+    if (!Plan(*update, *update_root, "Update Files/Physics/", "Media/Physics/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
   }
 
   uint64_t total = 0;
@@ -282,6 +293,12 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
   progress.total = total;
   progress.done = 0;
 
+  // Validate the replacement archive before touching an existing installation.
+  if (LoadPlus(game_dir).installed && !UninstallPlus(game_dir, user_dir, progress)) return false;
+  if (AreShadowsHidden(game_dir)) {
+    const auto error = SetShadowsHidden(game_dir, false);
+    if (!error.empty()) { progress.SetStatus(error); return false; }
+  }
   fs::remove_all(game_dir / kModDir, ec);
   fs::create_directories(game_dir / kModDir, ec);
   PlusState state;
@@ -290,7 +307,12 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
   state.mode = mode;
   state.harder_ai = harder_ai;
   const auto fail = [&](const std::string& message) {
-    Restore(game_dir, user_dir, state, progress);
+    if (!Restore(game_dir, user_dir, state, progress)) {
+      WriteState(game_dir, state);
+      progress.SetStatus(message + L(" Recovery incomplete; backups preserved.",
+                                     " Recuperacion incompleta; copias conservadas."));
+      return false;
+    }
     progress.SetStatus(message);
     return false;
   };
@@ -332,6 +354,7 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
         }
       }
     }
+    if (!WriteState(game_dir, state)) return fail(L("Could not save the mod state.", "No se pudo guardar el estado del mod."));
     fs::create_directories(out.parent_path(), ec);
     progress.SetStatus(std::string(L("Installing ", "Instalando ")) + copy.dest);
     if (!copy.zip->Extract(copy.index, out, progress)) {
@@ -367,8 +390,8 @@ bool UpdatePlus(const fs::path& game_dir, const fs::path& user_dir, const fs::pa
     return false;
   }
   std::map<std::string, Copy> plan;
-  Plan(update, *root, "Update Files/Game Mode DBs/", std::string(kModDir) + "/modes/", plan);
-  Plan(update, *root, "Update Files/Physics/", "Media/Physics/", plan);
+  if (!Plan(update, *root, "Update Files/Game Mode DBs/", std::string(kModDir) + "/modes/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
+  if (!Plan(update, *root, "Update Files/Physics/", "Media/Physics/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
   uint64_t total = 0;
   for (const auto& [key, copy] : plan) total += copy.size;
   progress.total = total;
@@ -411,6 +434,8 @@ bool UpdatePlus(const fs::path& game_dir, const fs::path& user_dir, const fs::pa
       state.added.push_back(copy.dest);
     }
   }
+  // Preserve the uninstall inventory before committing any replacement.
+  if (!WriteState(game_dir, state)) return discard(L("Could not save the mod state.", "No se pudo guardar el estado del mod."));
   for (const auto& [tmp, out] : staged) {
     fs::rename(tmp, out, ec);
     if (ec) {
@@ -583,8 +608,9 @@ std::string SetPlusFov(const fs::path& game_dir, const PlusFov& fov) {
         }
       },
       &text);
+  if (!read) return L("Could not read CameraSettings.ini.", "No se pudo leer CameraSettings.ini.");
   std::ofstream out(file, std::ios::binary | std::ios::trunc);
-  if (!read || !(out << text)) return L("Could not write CameraSettings.ini.", "No se pudo escribir CameraSettings.ini.");
+  if (!(out << text)) return L("Could not write CameraSettings.ini.", "No se pudo escribir CameraSettings.ini.");
   return {};
 }
 

@@ -98,6 +98,21 @@ add_custom_command(TARGET fm3-launcher POST_BUILD
 
 add_executable(fm3tool tools/fm3tool/main.cpp)
 target_link_libraries(fm3tool PRIVATE rex::runtime rex::kernel rex::system)
+
+option(FM3_BUILD_TESTS "Build launcher regression tests" OFF)
+if(FM3_BUILD_TESTS)
+    enable_testing()
+    add_executable(fm3-launcher-tests
+        tests/launcher_tests.cpp
+        launcher/src/installer.cpp
+        launcher/src/fm3_plus.cpp
+        launcher/src/sha256.cpp
+        ${miniz_SOURCE_DIR}/miniz.c)
+    target_include_directories(fm3-launcher-tests PRIVATE launcher/src ${miniz_SOURCE_DIR})
+    target_link_libraries(fm3-launcher-tests PRIVATE SDL3::SDL3-static)
+    set_target_properties(fm3-launcher-tests PROPERTIES CXX_STANDARD 17)
+    add_test(NAME launcher-regressions COMMAND fm3-launcher-tests)
+endif()
 add_custom_command(TARGET fm3tool POST_BUILD
     COMMAND "$<$<BOOL:$<TARGET_RUNTIME_DLLS:fm3tool>>:${CMAKE_COMMAND};-E;copy_if_different;$<TARGET_RUNTIME_DLLS:fm3tool>;$<TARGET_FILE_DIR:fm3tool>>"
     COMMAND_EXPAND_LISTS

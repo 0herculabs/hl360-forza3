@@ -12,6 +12,7 @@
 
 #include "i18n.h"
 #include "sha256.h"
+#include "safe_path.h"
 
 namespace launcher {
 namespace fs = std::filesystem;
@@ -70,6 +71,7 @@ bool WalkDirectory(std::ifstream& in, uint64_t partition, uint32_t sector, uint3
       continue;
     }
     const std::string name(reinterpret_cast<const char*>(e + 14), name_length);
+    if (!IsSafeRelativePath(name) || name.find('/') != std::string::npos) return false;
     const std::string path = prefix + name;
     if (attributes & 0x10) {
       if (!WalkDirectory(in, partition, start, length, path + "/", out, depth + 1)) {
@@ -106,8 +108,8 @@ bool ReadIndex(std::ifstream& in, std::vector<IsoFile>& files, TaskProgress& pro
                          "No es una imagen de disco de Xbox 360 (XDVDFS) reconocible."));
     return false;
   }
-  uint8_t root[8];
-  ReadAt(in, partition + 32 * kSector + 20, root, sizeof(root));
+  uint8_t root[8]{};
+  if (!ReadAt(in, partition + 32 * kSector + 20, root, sizeof(root))) return false;
   if (!WalkDirectory(in, partition, Le32(root), Le32(root + 4), "", files, 0)) {
     progress.SetStatus(L("The disc index is damaged or the image is incomplete.",
                          "El índice del disco está dañado o la imagen está incompleta."));

@@ -5,13 +5,13 @@
 **A work-in-progress static recompilation of the Xbox 360 racing game for modern Windows PCs.**
 
 ![Status](https://img.shields.io/badge/Status-Work_in_progress-F59E0B?style=for-the-badge)
-[![Release](https://img.shields.io/badge/Release-0.1.0-2563EB?style=for-the-badge&logo=github)](../../releases/tag/0.1.0)
+[![Release](https://img.shields.io/badge/Release-0.1.1-2563EB?style=for-the-badge&logo=github)](../../releases/tag/0.1.1)
 ![Platform](https://img.shields.io/badge/Platform-Windows_x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![Graphics](https://img.shields.io/badge/Graphics-Direct3D_12-107C10?style=for-the-badge)
 [![Game data](https://img.shields.io/badge/Game_files-Not_included-EF4444?style=for-the-badge)](#supported-version)
 [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white)](https://ko-fi.com/post/FORZA-MOTORSPORT-3-en-PC-SIN-EMULADOR-Port-Z8W528T56H)
 
-[Download 0.1.0](../../releases/tag/0.1.0) · [Supported version](#supported-version) · [Launcher](#launcher) · [Build from source](#building-from-source) · [Porting notes](#porting-notes)
+[Download 0.1.1](../../releases/tag/0.1.1) · [Supported version](#supported-version) · [Launcher](#launcher) · [Build from source](#building-from-source) · [Porting notes](#porting-notes)
 
 </div>
 
@@ -88,6 +88,20 @@ cd hl360-forza3
 ```
 
 Build the SDK once, then build the game, launcher, and supporting tools:
+
+Before building the game, extract your supported Disc 1 into `game/disc1/`;
+`game/disc1/default.xex` is required to generate the recompiled sources. After
+building the SDK you can use its extraction helper as follows:
+
+```bat
+scripts\build_sdk.cmd
+:: Build just the extraction helper; this does not require generated game code.
+cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH="%CD%\thirdparty\rexglue-sdk\out\install\win-amd64"
+cmake --build --preset win-amd64-release --target fm3tool
+scripts\install_game.cmd "C:\path\Disc 1.iso"
+```
+
+Run the CMake commands from a terminal with `scripts\devenv.cmd` loaded.
 
 ```bat
 :: Apply patches\sdk\*.patch and install the SDK into out\install
@@ -175,9 +189,21 @@ Initial compatibility settings were informed by [xenia-manager/optimized-setting
 
 The only FM3 entry in `game-patches`, *Disable hash checks*, does not match this Ultimate Collection `default.xex` and is not applied.
 
+## Antivirus check
+
+The release candidate was scanned with Microsoft Defender on 15 October 2026
+(security intelligence version `1.461.35.0`). No threats were detected in the
+packaged executables, libraries, or ZIP. This is the result of that specific
+scan, rather than a guarantee that every antivirus product will report the same
+result. No antivirus false positive was reproduced during this review.
+
+The [Forza 2 v0.3.0 release notes](https://github.com/0herculabs/hl360-Forza2/releases/tag/v0.3.0)
+document generic or heuristic detections involving `rexruntime.dll` in that
+port's earlier 0.2.0 package. Those reports concern different binaries and do
+not establish the detection status of this Forza 3 release.
+
 ## Credits and legal notice
 
 Built with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and the work of the [Xenia](https://github.com/xenia-project/xenia) and [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) projects.
 
 This is an independent preservation and compatibility project. It is not affiliated with, endorsed by, or sponsored by Microsoft or Turn 10 Studios.
-

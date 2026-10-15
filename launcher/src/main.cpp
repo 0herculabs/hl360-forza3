@@ -1672,6 +1672,10 @@ int RunHeadless(int argc, char** argv) {
     log << "error: missing game_files.sha256 or --game-dir\n";
     return 2;
   }
+  if ((!plus_zip.empty() || plus_uninstall) && user_dir.empty()) {
+    log << "error: --user-dir is required for mod operations\n";
+    return 2;
+  }
   TaskProgress progress;
   std::atomic<bool> finished{false};
   std::thread reporter([&] {
