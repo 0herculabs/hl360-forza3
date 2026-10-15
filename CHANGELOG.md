@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Check the actual FM3 Plus destination and backup paths before installation or
+  update. The mod has longer file paths than the original Disc 2, so a user-data
+  folder accepted for Disc 2 can still exceed Windows' path limit with the mod.
+- Explain how to choose shorter folders instead of failing partway through
+  extraction with a generic write error. Reject an overlong replacement before
+  uninstalling an existing mod.
+
 ## 0.1.1 - 2026-10-15
 
 - Reject unsafe paths in mod archives, uninstall state and ISO directory entries.

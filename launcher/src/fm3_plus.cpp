@@ -99,6 +99,35 @@ struct Copy {
   uint64_t size;
 };
 
+// The runtime also uses legacy Windows paths. Extracting with a long-path
+// prefix alone would install content that the game still cannot open.
+bool CheckPaths(const fs::path& game_dir, const fs::path& user_dir,
+                const std::map<std::string, Copy>& plan, bool updating, TaskProgress& progress) {
+#if defined(_WIN32)
+  for (const auto& [key, copy] : plan) {
+    const bool dlc = copy.dest.rfind(kDlcPrefix, 0) == 0;
+    fs::path target = dlc ? DlcDir(user_dir) / fs::u8path(copy.dest.substr(sizeof(kDlcPrefix) - 1))
+                          : game_dir / fs::u8path(copy.dest);
+    if (updating) target += ".plus-new";
+    // Ordinary game files also need a backup below .fm3-plus/backup.
+    const fs::path backup = !dlc && copy.dest.rfind(kModDir, 0) != 0
+        ? game_dir / kModDir / "backup" / fs::u8path(copy.dest) : target;
+    for (const auto& path : {target, backup}) {
+      std::error_code ec;
+      const fs::path full = fs::absolute(path, ec).lexically_normal();
+      if (ec) { progress.SetStatus(L("Could not resolve the installation path.", "No se pudo resolver la ruta de instalacion.")); return false; }
+      if (full.native().size() > 259 || full.parent_path().native().size() > 247) {
+        progress.SetStatus(std::string(L(
+            "FM3 Plus path too long. Choose shorter game and user-data folders in Install, e.g. C:\\FM3\\game and C:\\FM3\\user. No installation files were changed. Path: ",
+            "Ruta de FM3 Plus demasiado larga. Elige carpetas mas cortas para el juego y los datos de usuario en Instalacion, p. ej. C:\\FM3\\game y C:\\FM3\\user. No se han cambiado archivos de instalacion. Ruta: ")) + full.u8string());
+        return false;
+      }
+    }
+  }
+#endif
+  return true;
+}
+
 // Adds every file under `<root><from>` to the plan as `<to><rest>`. Keyed
 // case-insensitively, so the update archive overrides the base one.
 bool Plan(Zip& zip, const std::string& root, const std::string& from, const std::string& to,
@@ -272,6 +301,7 @@ bool InstallPlus(const fs::path& game_dir, const fs::path& user_dir, const fs::p
     if (!Plan(*update, *update_root, "Update Files/Physics/", "Media/Physics/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
   }
 
+  if (!CheckPaths(game_dir, user_dir, plan, false, progress)) return false;
   uint64_t total = 0;
   std::set<std::string> packages;
   for (const auto& [key, copy] : plan) {
@@ -392,6 +422,7 @@ bool UpdatePlus(const fs::path& game_dir, const fs::path& user_dir, const fs::pa
   std::map<std::string, Copy> plan;
   if (!Plan(update, *root, "Update Files/Game Mode DBs/", std::string(kModDir) + "/modes/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
   if (!Plan(update, *root, "Update Files/Physics/", "Media/Physics/", plan)) { progress.SetStatus(L("Unsafe archive path.", "Ruta insegura en el archivo.")); return false; }
+  if (!CheckPaths(game_dir, user_dir, plan, true, progress)) return false;
   uint64_t total = 0;
   for (const auto& [key, copy] : plan) total += copy.size;
   progress.total = total;

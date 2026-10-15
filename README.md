@@ -69,6 +69,15 @@ Project Forza Plus 3 supplies an alternative set of 18 content packages. During 
 > [!NOTE]
 > Keep the user-data path reasonably short. Windows' legacy 260-character path limit applies, and some Disc 2 file names add up to 162 characters. The launcher rejects user-data paths longer than 96 characters.
 
+> Project Forza Plus 3 has longer paths than the original Disc 2. Its v1.3 ZIP
+> requires a user-data root of at most 53 characters for the longest packaged
+> file. Use short folders such as `C:\FM3\game` and `C:\FM3\user`.
+> The launcher checks the actual mod archive paths before changing an existing
+> installation. To relocate existing user data, close the game and launcher,
+> copy the entire user folder to the shorter location, then select that folder
+> under **Install > Change user data folder**. Keep the old copy until the game
+> and saves have been checked.
+
 ## Building from source
 
 ### Requirements

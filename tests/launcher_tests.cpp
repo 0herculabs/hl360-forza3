@@ -63,6 +63,28 @@ int main() {
     std::ofstream(root / "game/Media/DB/gamedb.slt") << "original";
     Check(InstallPlus(root / "game", root / "user", root / "valid.zip", {},
                       PlusMode::kNormal, false, progress), "valid mod install failed");
+#if defined(_WIN32)
+    // Ultimate Collection permits a 96-character user root; Plus has longer
+    // package paths. Reject them before uninstalling a working mod.
+    const auto long_archive = (root / "long.zip").string();
+    zip = {};
+    Check(mz_zip_writer_init_file(&zip, long_archive.c_str(), 0), "cannot create long-path fixture");
+    Check(mz_zip_writer_add_mem(&zip, "Main Game Changes/Media/DB/gamedb.slt", "new", 3, 0), "cannot add fixture root");
+    const std::string package_path = std::string(40, 'A') + "/Media/DLCZips/000A_pri_65/media/cars/" +
+                                     std::string(35, 'x') + "/" + std::string(40, 'y') + "_build_report.html";
+    const std::string entry_path = "Disc 2 and DLCs/00000002/" + package_path;
+    Check(mz_zip_writer_add_mem(&zip, entry_path.c_str(), "html", 4, 0), "cannot add long-path fixture");
+    Check(mz_zip_writer_finalize_archive(&zip), "cannot finish long-path fixture");
+    mz_zip_writer_end(&zip);
+    std::wstring long_user = (root / "user-").wstring();
+    long_user.append(96 - long_user.size(), L'x');
+    Check(UserDirFitsContent(fs::path(long_user)), "fixture exceeds Disc 2 root limit");
+    Check(!InstallPlus(root / "game", fs::path(long_user), root / "long.zip", {},
+                       PlusMode::kNormal, false, progress), "long mod path accepted");
+    Check(progress.Status().find("path too long") != std::string::npos, "missing long-path diagnostic");
+    Check(LoadPlus(root / "game").installed, "long path removed installed mod");
+    Check(!fs::exists(fs::path(long_user)), "long-path failure modified user folder");
+#endif
     Check(!InstallPlus(root / "game", root / "user", root / "unsafe.zip", {},
                        PlusMode::kNormal, false, progress), "unsafe replacement accepted");
     Check(LoadPlus(root / "game").installed, "invalid replacement removed installed mod");
