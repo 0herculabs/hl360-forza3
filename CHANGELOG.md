@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 - 2026-10-15
 
+- Remove FM3 Plus explanatory annotations and the broken quick-start save option.
+- Package the release as FM3.zip with a short FM3 root folder.
 - Check the actual FM3 Plus destination and backup paths before installation or
   update. The mod has longer file paths than the original Disc 2, so a user-data
   folder accepted for Disc 2 can still exceed Windows' path limit with the mod.
@@ -9,7 +11,7 @@
   extraction with a generic write error. Reject an overlong replacement before
   uninstalling an existing mod.
 
-## 0.1.1 - 2026-10-15
+
 
 - Reject unsafe paths in mod archives, uninstall state and ISO directory entries.
 - Keep an installed mod when a replacement archive fails validation.
