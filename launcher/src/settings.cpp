@@ -96,6 +96,7 @@ bool Settings::Load(const std::filesystem::path& file) {
   Read(t, "profile_name", profile_name);
   Read(t, "profile_xuid", profile_xuid);
   ReadInt(t, "user_language", user_language);
+  ReadInt(t, "user_country", user_country);
 
   Read(t, "fullscreen", fullscreen);
   ReadInt(t, "monitor", monitor);
@@ -129,6 +130,7 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("profile_name", profile_name);
   t.insert("profile_xuid", profile_xuid);
   t.insert("user_language", user_language);
+  t.insert("user_country", user_country);
 
   t.insert("fullscreen", fullscreen);
   t.insert("monitor", monitor);
@@ -156,6 +158,9 @@ bool Settings::Save(const std::filesystem::path& file) const {
   for (const auto& b : binds) {
     t.insert(std::string("keybind_") + b.id, b.keys);
   }
+  // Shared stable shader policy; drop stale experimental overrides.
+  t.insert("async_shader_compilation", false);
+  t.insert("frame_stats", false);
   t.insert("audio_mute", audio_mute);
   return WriteFile(file,
                    "# Written by the FM3 launcher. The game loads this after fm3.toml,\n"

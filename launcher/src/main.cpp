@@ -63,7 +63,7 @@ ImU32 Col(const ImVec4& c, float alpha = 1.0f) {
   return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * alpha));
 }
 
-enum class Tab { kProfiles, kGraphics, kControls, kAudio, kPlus, kInstall };
+enum class Tab { kProfiles, kGraphics, kControls, kAudio, kPlus, kInstall, kSupport };
 
 // --- Key capture -----------------------------------------------------------
 
@@ -318,7 +318,7 @@ struct App {
     g_spanish = state.spanish;
     // First run of this launcher: start from the older files' values.
     if (!settings.Load(user_config)) {
-      if (state.spanish) settings.user_language = 5;
+      if (state.spanish) settings.user_language = 5, settings.user_country = 31;
       settings.Load(port_config);
       if (!state.legacy_game_dir.empty()) settings.game_data_root = state.legacy_game_dir;
       if (!state.legacy_user_dir.empty()) settings.user_data_root = state.legacy_user_dir;
@@ -635,7 +635,8 @@ bool Combo(const char* id, T& value, const std::vector<std::pair<T, const char*>
     if (v == value) preview = name;
   }
   bool changed = false;
-  if (ImGui::BeginCombo(id, preview)) {
+  // Show every entry: the default 8-row popup hid the last languages.
+  if (ImGui::BeginCombo(id, preview, ImGuiComboFlags_HeightLargest)) {
     for (const auto& [v, name] : items) {
       if (ImGui::Selectable(name, v == value)) {
         value = v;
@@ -1145,17 +1146,43 @@ void TabAudio(App& app) {
   BeginCard("##lang", L("Language", "Idioma"));
   if (BeginRows("##l")) {
     Row(L("Game language", "Idioma del juego"));
-    changed |= Combo<int>("##language", s.user_language,
-                          {{5, "Español"},
-                           {1, "English"},
-                           {4, "Français"},
-                           {3, "Deutsch"},
-                           {6, "Italiano"},
-                           {11, "Polski"},
-                           {12, L("Russian", "Ruso")},
-                           {2, L("Japanese", "Japonés")},
-                           {7, L("Korean", "Coreano")},
-                           {8, L("Chinese", "Chino")}});
+    // FM3 chooses its string table from the console country and language
+    // (table in sub_828AFE00): PL/CZ/HU go by country alone, so each entry
+    // sets both. Czech and Hungarian have no XC_LANGUAGE: report English.
+    struct GameLanguage {
+      int language;  // XC_LANGUAGE
+      int country;   // XC_COUNTRY
+      const char* name;
+    };
+    const GameLanguage languages[] = {
+        {5, 31, "Español"},
+        {1, 103, "English"},
+        {4, 34, "Français"},
+        {3, 24, "Deutsch"},
+        {6, 50, "Italiano"},
+        {11, 82, "Polski"},
+        {1, 23, L("Czech", "Checo")},
+        {1, 42, L("Hungarian", "Húngaro")},
+        {12, 88, L("Russian", "Ruso")},
+        {2, 53, L("Japanese", "Japonés")},
+        {7, 56, L("Korean", "Coreano")},
+        {8, 101, L("Chinese", "Chino")},
+    };
+    // Older files have no country: match the language alone then.
+    int current = -1;
+    for (int i = 0; i < int(std::size(languages)); ++i) {
+      if (languages[i].language == s.user_language && languages[i].country == s.user_country) current = i;
+    }
+    for (int i = 0; current < 0 && i < int(std::size(languages)); ++i) {
+      if (languages[i].language == s.user_language) current = i;
+    }
+    std::vector<std::pair<int, const char*>> items;
+    for (int i = 0; i < int(std::size(languages)); ++i) items.emplace_back(i, languages[i].name);
+    if (Combo<int>("##language", current, items)) {
+      s.user_language = languages[current].language;
+      s.user_country = languages[current].country;
+      changed = true;
+    }
     EndRows();
   }
   EndCard();
@@ -1479,6 +1506,31 @@ void TabInstall(App& app) {
   EndCard();
 }
 
+constexpr const char* kKofiUrl = "https://ko-fi.com/post/Forza-Motorsport-2-native-on-PC-E2Q428PZ5Y";
+
+void TabSupport() {
+  BeginCard("##support", L("Support the project", "Apoya el proyecto"));
+  TextDim(L("These ports are free projects made in my spare time. If you enjoy playing Forza Motorsport "
+            "natively on PC and want it to keep improving, you can support it on Ko-fi. Every "
+            "contribution helps me put more hours into it.",
+            "Estos ports son proyectos gratuitos hechos en mi tiempo libre. Si disfrutas jugando a Forza "
+            "Motorsport nativo en PC y quieres que siga mejorando, puedes apoyarlo en Ko-fi. Cada "
+            "aportación me ayuda a dedicarle más horas."));
+  ImGui::Dummy(ImVec2(0, S(8)));
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, S(10));
+  ImGui::PushFont(g_bold, ImGui::GetStyle().FontSizeBase * 1.15f);
+  if (PrimaryButton(L("Support on Ko-fi", "Apoyar en Ko-fi"), ImVec2(S(260), S(48)))) {
+    SDL_OpenURL(kKofiUrl);
+  }
+  ImGui::PopFont();
+  ImGui::PopStyleVar();
+  ImGui::Dummy(ImVec2(0, S(4)));
+  TextDim(kKofiUrl);
+  ImGui::Dummy(ImVec2(0, S(4)));
+  TextDim(L("Thank you!", "¡Gracias!"));
+  EndCard();
+}
+
 // Underlined text tabs across the top of the settings column.
 void TabBar(App& app) {
   const std::pair<Tab, const char*> tabs[] = {{Tab::kProfiles, L("Profiles", "Perfiles")},
@@ -1486,7 +1538,8 @@ void TabBar(App& app) {
                                               {Tab::kControls, L("Controls", "Controles")},
                                               {Tab::kAudio, L("Language & sound", "Idioma y sonido")},
                                               {Tab::kPlus, "FM3 Plus"},
-                                              {Tab::kInstall, L("Install", "Instalación")}};
+                                              {Tab::kInstall, L("Install", "Instalación")},
+                                              {Tab::kSupport, L("Support", "Apoyar")}};
   ImDrawList* dl = ImGui::GetWindowDrawList();
   ImGui::PushFont(g_bold, ImGui::GetStyle().FontSizeBase * 1.05f);
   for (const auto& [tab, label] : tabs) {
@@ -1767,7 +1820,8 @@ int main(int argc, char** argv) {
     if (a == "--screenshot-frame") screenshot_frame = std::max(4, std::atoi(argv[i + 1]));
     if (a == "--tab") {
       const std::string t = argv[i + 1];
-      app.tab = t == "plus"       ? Tab::kPlus
+      app.tab = t == "support" ? Tab::kSupport
+                : t == "plus"       ? Tab::kPlus
                 : t == "graphics" ? Tab::kGraphics
                 : t == "controls" ? Tab::kControls
                 : t == "audio"    ? Tab::kAudio
@@ -1897,6 +1951,7 @@ int main(int argc, char** argv) {
       case Tab::kAudio: TabAudio(app); break;
       case Tab::kPlus: TabPlus(app); break;
       case Tab::kInstall: TabInstall(app); break;
+      case Tab::kSupport: TabSupport(); break;
     }
     ImGui::PopStyleVar();
     ImGui::EndChild();

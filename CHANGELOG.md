@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.2 - 2026-10-17
+
+- Fix Polish staying in English: FM3 picks its text from the console country
+  as well as the language, and Polish, Czech and Hungarian load only for
+  Poland, the Czech Republic and Hungary. The launcher now sets the matching
+  country for each game language (`user_country` in fm3.user.toml).
+- Add Czech and Hungarian to the game language list.
+- Show every entry in launcher drop-down lists instead of an 8-row popup that
+  hid the last languages behind a scroll bar.
+- Spanish now uses the Spain locale, which selects the Castilian text.
+  Players upgrading from an older version should select their language again
+  once so the country is saved.
+- Add a Support / Apoyar launcher tab with the Ko-fi link shared by the Forza
+  ports.
+- Apply the shared stable shader policy: the launcher saves
+  `async_shader_compilation = false` and `frame_stats = false`, clearing old
+  experimental overrides. Frame-time diagnostics stay available with
+  `--frame_stats=true`.
+
 ## 0.1.1 - 2026-10-15
 
 - Remove FM3 Plus explanatory annotations and the broken quick-start save option.

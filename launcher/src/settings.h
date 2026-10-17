@@ -34,6 +34,9 @@ struct Settings {
   std::string profile_name = "Player";
   std::string profile_xuid;
   int user_language = 1;  // XC_LANGUAGE
+  // XC_COUNTRY. FM3 picks its text by country + language: Polish, Czech and
+  // Hungarian load only when the console country is PL/CZ/HU.
+  int user_country = 103;  // United States
 
   // Display
   bool fullscreen = true;

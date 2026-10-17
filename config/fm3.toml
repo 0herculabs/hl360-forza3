@@ -37,3 +37,6 @@ gpu_allow_invalid_fetch_constants = true
 # (suspected cause of FM3's square shadows).
 execute_unclipped_draw_vs_on_cpu = true
 
+
+# Frame-time diagnostics remain available through --frame_stats=true.
+frame_stats = false
