@@ -43,15 +43,21 @@ struct Settings {
   bool present_letterbox = true;
 
   // Quality
-  std::string gpu_backend = "d3d12";  // d3d12 | vulkan
+#if defined(__APPLE__)
+  std::string gpu_backend = "vulkan";  // diagnostic MoltenVK baseline
+#else
+  std::string gpu_backend = "d3d12";
+#endif
   int resolution_scale = 1;      // internal render scale over 1280x720
   int anisotropic_override = 3;  // 0..5 = off,1x,2x,4x,8x,16x
   std::string swap_post_effect = "none";    // none | fxaa | fxaa_extreme
   std::string present_effect = "bilinear";  // bilinear | cas | fsr
+  int fm3_frame_limit = 0;  // 0 = game default; 30/60 experimental host cap
 
   // Input
   std::string input_backend = "sdl";  // sdl | xinput
   bool mnk_mode = true;
+  bool controller_vibration = false;
   bool mnk_mouse = false;
   double mnk_sensitivity = 1.0;
   std::vector<KeyBind> binds;

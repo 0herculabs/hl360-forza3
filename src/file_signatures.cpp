@@ -17,10 +17,16 @@
 
 #include "file_signatures.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <bcrypt.h>
+#elif defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#else
+#include <crypto/TinySHA1.hpp>
+#endif
 
 #include <cstring>
 #include <fstream>
@@ -52,8 +58,19 @@ void StoreBe32(uint8_t* p, uint32_t v) {
 }
 
 bool Sha1(const uint8_t* data, size_t size, uint8_t out[kHashSize]) {
+#if defined(_WIN32)
   return BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA1_ALG_HANDLE, nullptr, 0, const_cast<uint8_t*>(data),
                                    ULONG(size), out, kHashSize));
+#elif defined(__APPLE__)
+  return CC_SHA1(data, static_cast<CC_LONG>(size), out) != nullptr;
+#else
+  sha1::SHA1 hash;
+  hash.processBytes(data, size);
+  sha1::SHA1::digest8_t digest;
+  hash.finalize(digest);
+  std::memcpy(out, digest, kHashSize);
+  return true;
+#endif
 }
 
 struct Entry {

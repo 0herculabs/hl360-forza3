@@ -4,6 +4,7 @@
 
 #include "crash_handler.h"
 #include "file_signatures.h"
+#include "frame_stats.h"
 
 #include <charconv>
 
@@ -23,9 +24,15 @@ REXCVAR_DEFINE_STRING(profile_name, "", "FM3/Profile",
 REXCVAR_DEFINE_STRING(profile_xuid, "", "FM3/Profile",
                       "Offline XUID of the signed-in profile, 16 hex digits");
 
-REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "FM3/Graphics",
-                      "Graphics backend for the xenos GPU plugin: any, d3d12, vulkan")
-    .allowed({"any", "d3d12", "vulkan"})
+#if defined(__APPLE__)
+#define FM3_DEFAULT_GPU_BACKEND "vulkan"
+#else
+#define FM3_DEFAULT_GPU_BACKEND "d3d12"
+#endif
+
+REXCVAR_DEFINE_STRING(gpu_backend, FM3_DEFAULT_GPU_BACKEND, "FM3/Graphics",
+                      "Graphics backend for the xenos GPU plugin: any, d3d12, vulkan, metal")
+    .allowed({"any", "d3d12", "vulkan", "metal"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(crash_test, false, "FM3/Debug",
@@ -101,6 +108,7 @@ void Fm3App::OnPostLoadXexImage() {
 }
 
 void Fm3App::OnPostSetup() {
+  SetGuestFrameStats([] { return GetFm3FrameStats(); });
   MountCachePartition(runtime(), user_data_root());
 
   auto* profile = runtime()->kernel_state()->user_profile();

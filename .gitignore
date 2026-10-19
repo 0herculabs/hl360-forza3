@@ -21,3 +21,7 @@
 .idea/
 Thumbs.db
 .DS_Store
+docs/MACOS_PORT_PLAN.md
+
+# Python helper bytecode
+__pycache__/
