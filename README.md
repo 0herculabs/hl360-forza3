@@ -5,13 +5,13 @@
 **A work-in-progress static recompilation of the Xbox 360 racing game for Windows, with experimental Apple Silicon macOS support.**
 
 ![Status](https://img.shields.io/badge/Status-Work_in_progress-F59E0B?style=for-the-badge)
-[![Release](https://img.shields.io/badge/Release-0.1.1-2563EB?style=for-the-badge&logo=github)](../../releases/tag/0.1.1)
+[![Release](https://img.shields.io/badge/Release-0.1.3-2563EB?style=for-the-badge&logo=github)](../../releases/tag/0.1.3)
 ![Platform](https://img.shields.io/badge/Platform-Windows_x64-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![Graphics](https://img.shields.io/badge/Graphics-Direct3D_12-107C10?style=for-the-badge)
 [![Game data](https://img.shields.io/badge/Game_files-Not_included-EF4444?style=for-the-badge)](#supported-version)
 [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white)](https://ko-fi.com/post/FORZA-MOTORSPORT-3-en-PC-SIN-EMULADOR-Port-Z8W528T56H)
 
-[Download 0.1.1](../../releases/tag/0.1.1) · [Supported version](#supported-version) · [Launcher](#launcher) · [Build from source](#building-from-source) · [Porting notes](#porting-notes)
+[Download 0.1.3](../../releases/tag/0.1.3) · [Supported version](#supported-version) · [Launcher](#launcher) · [Build from source](#building-from-source) · [Porting notes](#porting-notes)
 
 </div>
 
@@ -219,3 +219,15 @@ not establish the detection status of this Forza 3 release.
 Built with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and the work of the [Xenia](https://github.com/xenia-project/xenia) and [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) projects.
 
 This is an independent preservation and compatibility project. It is not affiliated with, endorsed by, or sponsored by Microsoft or Turn 10 Studios.
+
+
+### Shared shader configuration
+
+FM2, FM3 and FM4 use automatic persistent shader caching and preparation of
+previously recorded pipelines. Synchronous compilation remains the stable
+default (`async_shader_compilation = false`), and frame-time diagnostics are
+disabled in normal play. The launcher clears old experimental overrides when
+saving settings. There is no experimental shader toggle in the normal UI.
+First encounters with uncached content may still cause compilation pauses.
+
+The **Support / Apoyar** tab shares its layout and existing Ko-fi destination with the other Forza ports. Shader preparation remains automatic, with no manual preparation button.

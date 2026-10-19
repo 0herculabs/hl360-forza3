@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.3 - 2026-10-17
+
+- Fix missing cars with Project Forza Plus 3 (only 414 available). Two runtime
+  bugs kept the mod's 14 DLC car packs out of the game:
+  - Packages without a `.header` file (all of the mod's packs) were listed as
+    empty or as copies of the previous package, so FM3 mounted the Ultimate
+    Collection's last pack over and over instead of the mod's.
+  - Each pack marks its cars as installed through
+    `Media/LicenseMasks/<bit>.sql` scripts, which FM3 runs only for the
+    licenses a package is granted. The runtime granted none; it now applies
+    `license_mask` to content packages, as Xenia did, and `fm3.toml` grants
+    every license (`license_mask = 0xFFFFFFFF`), as the mod expects.
+- The 114 cars of the mod's DLC packs (VIP, Stig's Garage, Pre-Order,
+  Community Choice Classics, Hot Holidays, Auto Week, Hyundai, Motorsport
+  Legends and others) are now available. The unmodded game is unchanged.
+
+## 0.1.2 - 2026-10-17
+
+- Fix Polish staying in English: FM3 picks its text from the console country
+  as well as the language, and Polish, Czech and Hungarian load only for
+  Poland, the Czech Republic and Hungary. The launcher now sets the matching
+  country for each game language (`user_country` in fm3.user.toml).
+- Add Czech and Hungarian to the game language list.
+- Show every entry in launcher drop-down lists instead of an 8-row popup that
+  hid the last languages behind a scroll bar.
+- Spanish now uses the Spain locale, which selects the Castilian text.
+  Players upgrading from an older version should select their language again
+  once so the country is saved.
+- Add a Support / Apoyar launcher tab with the Ko-fi link shared by the Forza
+  ports.
+- Apply the shared stable shader policy: the launcher saves
+  `async_shader_compilation = false` and `frame_stats = false`, clearing old
+  experimental overrides. Frame-time diagnostics stay available with
+  `--frame_stats=true`.
+
 ## 0.1.1 - 2026-10-15
 
 - Remove FM3 Plus explanatory annotations and the broken quick-start save option.

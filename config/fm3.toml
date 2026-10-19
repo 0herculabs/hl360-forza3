@@ -40,3 +40,13 @@ gpu_allow_invalid_fetch_constants = true
 # (suspected cause of FM3's square shadows).
 execute_unclipped_draw_vs_on_cpu = true
 
+
+# Every content license, as Xenia's license_mask = -1 (what Project Forza Plus 3
+# ships for). Each DLC pack runs Media/LicenseMasks/<bit>.sql for the bits it
+# is granted, which marks its cars as installed; with none, FM3 Plus's 14 car
+# packs stay hidden (414 cars). The Ultimate Collection packs carry no such
+# scripts, so this changes nothing without the mod.
+license_mask = 0xFFFFFFFF
+
+# Frame-time diagnostics remain available through --frame_stats=true.
+frame_stats = false
