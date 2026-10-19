@@ -12,6 +12,9 @@ gpu_backend = "d3d12"
 # latency.
 audio_maxqframes = 16
 
+# Player preference: controller motors off. Can be enabled in Controls/F4 settings.
+controller_vibration = false
+
 # Not the host's vertical sync: in the SDK this is the guest vblank timer. On,
 # the console's 60 Hz vblank; off, one every millisecond - FM3 paces itself on
 # vblanks and runs too fast. The launcher does not offer it.

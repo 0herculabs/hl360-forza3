@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <optional>
 #include <string>
 
 namespace launcher {
@@ -19,6 +21,14 @@ inline bool IsSafeRelativePath(const std::string& path) {
     start = end + 1;
   }
   return false;
+}
+
+// Xbox device paths use backslashes even on POSIX hosts. An empty path is
+// the device root; every non-root entry must remain below the destination.
+inline std::optional<std::string> NormalizeGuestRelativePath(std::string path) {
+  std::replace(path.begin(), path.end(), '\\', '/');
+  if (!path.empty() && !IsSafeRelativePath(path)) return std::nullopt;
+  return path;
 }
 
 }  // namespace launcher

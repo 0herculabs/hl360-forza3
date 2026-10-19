@@ -1,3 +1,11 @@
+#if defined(_WIN32)
+#define FM3_GAME_EXECUTABLE "fm3.exe"
+#define FM3_TOOL_EXECUTABLE "fm3tool.exe"
+#else
+#define FM3_GAME_EXECUTABLE "fm3"
+#define FM3_TOOL_EXECUTABLE "fm3tool"
+#endif
+
 // fm3-launcher - profiles, settings and game install for the recompiled
 // Forza Motorsport 3. Sits next to fm3.exe; writes fm3.user.toml (read by the
 // game after its own fm3.toml) and launches the game.
@@ -38,6 +46,7 @@
 #include "i18n.h"
 #include "installer.h"
 #include "settings.h"
+#include "package_path.h"
 
 namespace fs = std::filesystem;
 using namespace launcher;
@@ -323,6 +332,11 @@ struct App {
       if (!state.legacy_game_dir.empty()) settings.game_data_root = state.legacy_game_dir;
       if (!state.legacy_user_dir.empty()) settings.user_data_root = state.legacy_user_dir;
     }
+#if defined(__APPLE__)
+    if (settings.gpu_backend == "metal" && !fs::exists(exe_dir / "metal-backend.json")) {
+      settings.gpu_backend = "vulkan";
+    }
+#endif
     if (state.profiles.empty()) {
       state.profiles.push_back({IsValidGamertag(settings.profile_name) ? settings.profile_name : "Player",
                                 settings.profile_xuid.size() == 16 ? settings.profile_xuid : GenerateXuid()});
@@ -503,7 +517,9 @@ struct App {
                     L("). The log and crash report are in the logs folder.",
                       "). El registro y el informe de fallo están en la carpeta logs.");
       } else {
+#if !defined(__APPLE__)
         DeleteSessionLogs();
+#endif
       }
     }
   }
@@ -972,6 +988,15 @@ void TabGraphics(App& app) {
 
   BeginCard("##display", L("Display", "Pantalla"));
   if (BeginRows("##d")) {
+#if defined(__APPLE__)
+    Row(L("Renderer", "Renderizador"));
+    if (fs::exists(app.exe_dir / "metal-backend.json")) {
+      changed |= Segmented<std::string>("renderer", s.gpu_backend,
+                                        {{"vulkan", "Vulkan"}, {"metal", "Metal"}});
+    } else {
+      ImGui::TextUnformatted("Vulkan");
+    }
+#endif
     Row(L("Mode", "Modo"));
     int mode = s.fullscreen ? 1 : 0;
     if (Segmented<int>("mode", mode, {{1, L("Fullscreen", "Pantalla completa")}, {0, L("Window", "Ventana")}})) {
@@ -1006,6 +1031,9 @@ void TabGraphics(App& app) {
     }
     Row(L("Keep 16:9", "Mantener 16:9"));
     changed |= Toggle("##letterbox", &s.present_letterbox);
+    Row(L("Frame cap (experimental)", "Límite de FPS (experimental)"));
+    changed |= Segmented<int>("framecap", s.fm3_frame_limit,
+                              {{0, L("Game default", "Predeterminado")}, {30, "30 FPS"}, {60, "60 FPS"}});
     EndRows();
   }
   EndCard();
@@ -1056,6 +1084,8 @@ void TabControls(App& app) {
   if (BeginRows("##p")) {
     Row(L("Input system", "Sistema de entrada"));
     changed |= Segmented<std::string>("backend", s.input_backend, {{"sdl", "SDL"}, {"xinput", "XInput"}});
+    Row(L("Controller vibration", "Vibración del mando"));
+    changed |= Toggle("##vibration", &s.controller_vibration);
     EndRows();
   }
   EndCard();
@@ -1658,7 +1688,7 @@ int RunHeadless(int argc, char** argv) {
     else if (a == "--uninstall-plus") plus_uninstall = true;
   }
   std::ofstream log(log_path.empty() ? "launcher-headless.log" : log_path);
-  const fs::path exe_dir = fs::u8path(SDL_GetBasePath());
+  const fs::path exe_dir = PackageDirectory(fs::u8path(SDL_GetBasePath()));
   const auto manifest = LoadManifest(exe_dir / "game_files.sha256");
   if (manifest.empty() || dir.empty()) {
     log << "error: missing game_files.sha256 or --game-dir\n";
@@ -1700,7 +1730,7 @@ int RunHeadless(int argc, char** argv) {
         ok = false;
       } else {
         ok = InstallContentDisc(fs::u8path(iso), fs::u8path(dir), fs::u8path(user_dir),
-                                exe_dir / "fm3tool.exe", progress);
+                                exe_dir / FM3_TOOL_EXECUTABLE, progress);
         log << "content: " << (ok ? "ok" : "FAILED") << " - " << progress.Status() << std::endl;
         log << "packages: " << CountContentPackages(fs::u8path(user_dir)) << "/" << kContentPackages << std::endl;
       }
@@ -1731,7 +1761,7 @@ int RunHeadless(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  fm3::InstallCrashHandler(fs::u8path(SDL_GetBasePath()) / "logs");
+  fm3::InstallCrashHandler(PackageDirectory(fs::u8path(SDL_GetBasePath())) / "logs");
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--import-iso" || a == "--verify" || a == "--install-plus" || a == "--uninstall-plus") {
@@ -1743,13 +1773,13 @@ int main(int argc, char** argv) {
     return 1;
   }
   App app;
-  app.exe_dir = fs::u8path(SDL_GetBasePath());
+  app.exe_dir = PackageDirectory(fs::u8path(SDL_GetBasePath()));
   app.user_config = app.exe_dir / "fm3.user.toml";
   app.port_config = app.exe_dir / "fm3.toml";
   app.launcher_config = app.exe_dir / "launcher.toml";
   app.manifest_path = app.exe_dir / "game_files.sha256";
-  app.game_exe = app.exe_dir / "fm3.exe";
-  app.tool_exe = app.exe_dir / "fm3tool.exe";
+  app.game_exe = app.exe_dir / FM3_GAME_EXECUTABLE;
+  app.tool_exe = app.exe_dir / FM3_TOOL_EXECUTABLE;
   app.cover_path = app.exe_dir / "cover.jpg";
   app.Load();
   app.manifest = LoadManifest(app.manifest_path);
@@ -1792,6 +1822,11 @@ int main(int argc, char** argv) {
   const char* bold = "C:\\Windows\\Fonts\\seguisb.ttf";
   // Segoe UI lacks arrows and a few symbols (↺ ← ↑); merge Segoe UI Symbol in.
   const char* symbols = "C:\\Windows\\Fonts\\seguisym.ttf";
+#if defined(__APPLE__)
+  regular = "/System/Library/Fonts/Supplemental/Arial.ttf";
+  bold = "/System/Library/Fonts/Supplemental/Arial Bold.ttf";
+  symbols = "/System/Library/Fonts/Apple Symbols.ttf";
+#endif
   ImFontConfig merge;
   merge.MergeMode = true;
   if (fs::exists(regular)) {

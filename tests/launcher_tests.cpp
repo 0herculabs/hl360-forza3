@@ -1,6 +1,8 @@
 #include "fm3_plus.h"
 #include "safe_path.h"
 #include "sha256.h"
+#include "settings.h"
+#include "package_path.h"
 #include "miniz.h"
 
 #include <chrono>
@@ -20,6 +22,45 @@ int main() {
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   fs::create_directories(root / "game");
   try {
+    Check(PackageDirectory(root / "package/") == root / "package", "standalone package path changed");
+#if defined(__APPLE__)
+    Check(PackageDirectory(root / "package/FM3 Launcher.app/Contents/MacOS/") == root / "package",
+          "Finder bundle did not resolve sibling game package");
+    Check(PackageDirectory(root / "package/FM3 Launcher.app/Contents/Resources/") == root / "package",
+          "SDL bundle resources did not resolve sibling game package");
+#endif
+    // A Windows profile copied to a Mac must not select an unavailable GPU.
+    const auto settings_path = root / "fm3.user.toml";
+    std::ofstream(settings_path) << "gpu_backend = \"d3d12\"\nvsync = false\nreadback_resolve = \"full\"\n";
+    Settings settings;
+    Check(settings.Load(settings_path), "settings fixture failed to load");
+#if defined(__APPLE__)
+    Check(settings.gpu_backend == "vulkan", "Mac settings selected D3D12");
+#else
+    Check(settings.gpu_backend == "d3d12", "Windows renderer default changed");
+#endif
+#if defined(__APPLE__)
+    std::ofstream(settings_path) << "gpu_backend = \"metal\"\n";
+    Check(settings.Load(settings_path) && settings.gpu_backend == "metal", "Mac Metal selection was discarded");
+#endif
+    Check(settings.Save(settings_path), "settings save failed");
+    settings.controller_vibration = false;
+    settings.fm3_frame_limit = 30;
+    Check(settings.Save(settings_path), "new settings save failed");
+    Settings reloaded;
+    Check(reloaded.Load(settings_path) && !reloaded.controller_vibration &&
+          reloaded.fm3_frame_limit == 30, "vibration/frame cap preference lost");
+    std::ifstream settings_file(settings_path);
+    const std::string saved((std::istreambuf_iterator<char>(settings_file)), {});
+    Check(saved.find("vsync = true") != std::string::npos, "guest timing was not preserved");
+    Check(saved.find("readback_resolve = 'fast'") != std::string::npos ||
+          saved.find("readback_resolve = \"fast\"") != std::string::npos,
+          "fast readback was not preserved");
+    Check(NormalizeGuestRelativePath("Media\\AI\\car.bin") == "Media/AI/car.bin",
+          "Xbox path separators were not converted");
+    Check(NormalizeGuestRelativePath("") == "", "device root rejected");
+    Check(!NormalizeGuestRelativePath("Media\\..\\outside"), "device traversal accepted");
+    Check(!NormalizeGuestRelativePath("\\outside"), "absolute device path accepted");
     for (const char* path : {"../outside", "Media/../../outside", "C:/outside", "/outside",
                              "Media\\..\\outside", "file:stream", "Media/../x", "Media/x. ", "Media//x"})
       Check(!IsSafeRelativePath(path), "unsafe path accepted");

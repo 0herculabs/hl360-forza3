@@ -2,7 +2,7 @@
 
 # Forza Motorsport 3 — Native PC Recompilation
 
-**A work-in-progress static recompilation of the Xbox 360 racing game for modern Windows PCs.**
+**A work-in-progress static recompilation of the Xbox 360 racing game for Windows, with experimental Apple Silicon macOS support.**
 
 ![Status](https://img.shields.io/badge/Status-Work_in_progress-F59E0B?style=for-the-badge)
 [![Release](https://img.shields.io/badge/Release-0.1.3-2563EB?style=for-the-badge&logo=github)](../../releases/tag/0.1.3)
@@ -15,7 +15,7 @@
 
 </div>
 
-A work-in-progress static recompilation of *Forza Motorsport 3: Ultimate Collection* that runs natively on Windows PCs. The Xbox 360 PowerPC code is translated to C++ using the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), while the runtime provides the console services required by the game, including graphics, audio, input, profiles, file-system access, and downloadable content.
+A work-in-progress static recompilation of *Forza Motorsport 3: Ultimate Collection* that runs natively on Windows PCs, with experimental native Metal support on Apple Silicon Macs. The Xbox 360 PowerPC code is translated to C++ using the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), while the runtime provides the console services required by the game, including graphics, audio, input, profiles, file-system access, and downloadable content.
 
 The project includes its own launcher for installing and verifying both game discs, managing local profiles, configuring the port, and installing Project Forza Plus 3.
 
@@ -79,6 +79,9 @@ Project Forza Plus 3 supplies an alternative set of 18 content packages. During 
 > and saves have been checked.
 
 ## Building from source
+
+Experimental Apple Silicon build instructions and current limitations are in
+[docs/MACOS.md](docs/MACOS.md). The instructions below cover Windows.
 
 ### Requirements
 

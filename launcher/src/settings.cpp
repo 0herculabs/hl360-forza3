@@ -82,6 +82,7 @@ void Settings::ResetDisplay() {
   anisotropic_override = defaults.anisotropic_override;
   swap_post_effect = defaults.swap_post_effect;
   present_effect = defaults.present_effect;
+  fm3_frame_limit = defaults.fm3_frame_limit;
 }
 
 bool Settings::Load(const std::filesystem::path& file) {
@@ -107,13 +108,19 @@ bool Settings::Load(const std::filesystem::path& file) {
 
   ReadInt(t, "resolution_scale", resolution_scale);
   ReadInt(t, "anisotropic_override", anisotropic_override);
-  // Vulkan renders FM3 incorrectly: always D3D12 (drops stale values).
-  gpu_backend = "d3d12";
+  gpu_backend = Settings{}.gpu_backend;
+#if defined(__APPLE__)
+  Read(t, "gpu_backend", gpu_backend);
+  if (gpu_backend != "metal" && gpu_backend != "vulkan") gpu_backend = "vulkan";
+#endif
   Read(t, "swap_post_effect", swap_post_effect);
   Read(t, "present_effect", present_effect);
+  ReadInt(t, "fm3_frame_limit", fm3_frame_limit);
+  if (fm3_frame_limit != 30 && fm3_frame_limit != 60) fm3_frame_limit = 0;
 
   Read(t, "input_backend", input_backend);
   Read(t, "mnk_mode", mnk_mode);
+  Read(t, "controller_vibration", controller_vibration);
   Read(t, "mnk_mouse", mnk_mouse);
   Read(t, "mnk_sensitivity", mnk_sensitivity);
   for (auto& b : binds) {
@@ -146,6 +153,7 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("anisotropic_override", anisotropic_override);
   t.insert("swap_post_effect", swap_post_effect);
   t.insert("present_effect", present_effect);
+  t.insert("fm3_frame_limit", fm3_frame_limit);
   // FM3 needs render-to-texture readback for the road and car thumbnails.
   // "fast" keeps the fix without the 30 fps cost of the synchronous mode.
   // Always write it so old launcher files containing full/some/none are healed.
@@ -153,6 +161,7 @@ bool Settings::Save(const std::filesystem::path& file) const {
 
   t.insert("input_backend", input_backend);
   t.insert("mnk_mode", mnk_mode);
+  t.insert("controller_vibration", controller_vibration);
   t.insert("mnk_mouse", mnk_mouse);
   t.insert("mnk_sensitivity", mnk_sensitivity);
   for (const auto& b : binds) {
