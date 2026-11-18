@@ -18,6 +18,7 @@ set(FM3_SOURCES
     src/crash_handler.cpp
     src/frame_stats.cpp
     src/file_signatures.cpp
+    src/gpu_wait_backoff.cpp
 )
 
 if(WIN32)
@@ -32,7 +33,7 @@ if(WIN32)
     # PDB so crash reports can name the recompiled functions (sub_XXXXXXXX).
     target_compile_options(fm3 PRIVATE -gline-tables-only)
     target_link_options(fm3 PRIVATE -g)
-    target_link_libraries(fm3 PRIVATE dbghelp bcrypt)
+    target_link_libraries(fm3 PRIVATE dbghelp bcrypt winmm)
 endif()
 
 # --- Launcher -----------------------------------------------------------------
