@@ -16,6 +16,7 @@
 REXCVAR_DEFINE_BOOL(frame_stats, false, "FM3/Debug", "Log frame pacing statistics every 5 seconds");
 
 extern "C" void __imp__sub_824AF280(PPCContext& __restrict ctx, uint8_t* base);
+namespace fm3 { void LaunchTimerFrame(uint8_t* base); }  // launch_timer.cpp
 
 namespace {
 
@@ -31,6 +32,7 @@ struct Stats {
 
 // Overrides the weak alias the generated code calls.
 extern "C" void sub_824AF280(PPCContext& __restrict ctx, uint8_t* base) {
+  fm3::LaunchTimerFrame(base);
   if (!REXCVAR_GET(frame_stats)) {
     __imp__sub_824AF280(ctx, base);
     return;
