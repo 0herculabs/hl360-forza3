@@ -18,6 +18,7 @@ set(FM3_SOURCES
     src/crash_handler.cpp
     src/frame_stats.cpp
     src/file_signatures.cpp
+    src/drag_grip.cpp
 )
 
 if(WIN32)
