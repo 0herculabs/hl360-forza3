@@ -4,8 +4,18 @@
 
 #include "crash_handler.h"
 #include "file_signatures.h"
+#include "player2_profile.h"
 
 #include <charconv>
+#include <chrono>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -22,6 +32,55 @@ REXCVAR_DEFINE_STRING(profile_name, "", "FM3/Profile",
                       "Gamertag of the signed-in profile (empty = SDK default)");
 REXCVAR_DEFINE_STRING(profile_xuid, "", "FM3/Profile",
                       "Offline XUID of the signed-in profile, 16 hex digits");
+REXCVAR_DECLARE(bool, audio_diagnostics);
+REXCVAR_DECLARE(bool, frame_stats);
+REXCVAR_DECLARE(bool, gpu_wait_backoff);
+REXCVAR_DECLARE(bool, split_fullscreen_views);
+REXCVAR_DEFINE_BOOL(dual_monitor_autostart, false, "FM3/Display",
+    "Start the local dual-monitor controls with the game")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(precise_frame_timer, false, "FM3/Performance",
+    "Request 1 ms Windows timer resolution for the guest vblank scheduler")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+Fm3App::~Fm3App() {
+#ifdef _WIN32
+  if (precise_timer_active_) timeEndPeriod(1);
+#endif
+}
+
+#ifdef _WIN32
+static void StartDualMonitorControls() {
+  if (!REXCVAR_GET(dual_monitor_autostart)) return;
+  const auto helper = rex::filesystem::GetExecutableFolder() / "FM3-dual-monitor.exe";
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(helper, ec)) {
+    REXLOG_WARN("Dual-monitor companion missing: {}", helper.string());
+    return;
+  }
+  // Explicit executable and working directory: no shell or PATH lookup.
+  // The helper waits for this process's window without blocking game startup.
+  auto command = L"\"" + helper.wstring() + L"\" --auto " + std::to_wstring(GetCurrentProcessId());
+  if (REXCVAR_GET(split_fullscreen_views)) command += L" --fill";
+  STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_SHOWMINNOACTIVE;
+  PROCESS_INFORMATION child{};
+  if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
+                     nullptr, helper.parent_path().c_str(), &startup, &child)) {
+    REXLOG_INFO("Dual-monitor companion autostart: pid={}", child.dwProcessId);
+    CloseHandle(child.hThread); CloseHandle(child.hProcess);
+  } else REXLOG_WARN("Dual-monitor companion launch failed: {}", GetLastError());
+}
+
+// Startup-only probe: do not add sampling or sleeps to the race loop.
+static double MeasureTimerSleep() {
+  const auto start = std::chrono::steady_clock::now();
+  constexpr int samples = 32;
+  for (int i = 0; i < samples; ++i) ::Sleep(1);
+  return std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count() / samples;
+}
+#endif
 
 REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "FM3/Graphics",
                       "Graphics backend for the xenos GPU plugin: any, d3d12, vulkan")
@@ -101,7 +160,27 @@ void Fm3App::OnPostLoadXexImage() {
 }
 
 void Fm3App::OnPostSetup() {
+#ifdef _WIN32
+  StartDualMonitorControls();
+  // VSync's worker uses Sleep(1). Without a process timer request, Windows
+  // may round that wait to a full scheduler tick. Preserve the 60 Hz guest
+  // clock and all audio synchronization; only improve wake-up granularity.
+  const bool measure_timer = REXCVAR_GET(frame_stats);
+  const double before = measure_timer ? MeasureTimerSleep() : 0.0;
+  if (REXCVAR_GET(precise_frame_timer) && !precise_timer_active_) {
+    const auto result = timeBeginPeriod(1);
+    precise_timer_active_ = result == TIMERR_NOERROR;
+    if (!precise_timer_active_) REXLOG_WARN("Frame timer request failed: {}", result);
+  }
+  REXLOG_INFO("Precise frame timer: {}", precise_timer_active_ ? "active (1 ms)" : "disabled");
+  if (measure_timer) {
+    REXLOG_INFO("Frame timer startup probe: Sleep(1) mean before={:.3f} ms after={:.3f} ms (32 samples; not FPS)",
+        before, MeasureTimerSleep());
+  }
+#endif
   MountCachePartition(runtime(), user_data_root());
+  REXLOG_INFO("Graphics fence backoff: {} (XDK wait caller 824B5010)",
+      REXCVAR_GET(gpu_wait_backoff) ? "enabled" : "disabled");
 
   auto* profile = runtime()->kernel_state()->user_profile();
 
@@ -122,6 +201,9 @@ void Fm3App::OnPostSetup() {
   }
 
   REXLOG_INFO("Signed in as '{}' (XUID {:016X})", profile->name(), profile->xuid());
+  fm3::InitPlayer2Profile(user_data_root(), profile->xuid());
+  REXLOG_INFO("Audio sample/timing diagnostics: {} (audio mix and synchronization unchanged)",
+      REXCVAR_GET(audio_diagnostics)?"enabled":"disabled");
 
   if (REXCVAR_GET(crash_test)) {
     *static_cast<volatile int*>(nullptr) = 0;

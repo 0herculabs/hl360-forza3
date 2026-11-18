@@ -7,6 +7,7 @@
 class Fm3App : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
+  ~Fm3App() override;
 
   // Defined in main.cpp, the only TU that sees the generated PPCImageConfig.
   static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx);
@@ -31,4 +32,7 @@ class Fm3App : public rex::ReXApp {
   // Without it the window is presented once per game frame (same as the FM2
   // recompilation).
   std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog() override;
+
+ private:
+  bool precise_timer_active_ = false;
 };
