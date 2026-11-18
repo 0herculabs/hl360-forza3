@@ -18,6 +18,19 @@ set(FM3_SOURCES
     src/crash_handler.cpp
     src/frame_stats.cpp
     src/file_signatures.cpp
+    src/career_trace.cpp
+    src/controller_swap.cpp
+    src/drag_grip.cpp
+    src/focus_shadow.cpp
+    src/gpu_probe.cpp
+    src/gpu_wait_backoff.cpp
+    src/launch_timer.cpp
+    src/multiplayer_menu.cpp
+    src/player2_profile.cpp
+    src/season_coop.cpp
+    src/second_profile.cpp
+    src/sell_value.cpp
+    src/split_fullscreen.cpp
 )
 
 if(WIN32)
@@ -32,7 +45,7 @@ if(WIN32)
     # PDB so crash reports can name the recompiled functions (sub_XXXXXXXX).
     target_compile_options(fm3 PRIVATE -gline-tables-only)
     target_link_options(fm3 PRIVATE -g)
-    target_link_libraries(fm3 PRIVATE dbghelp bcrypt)
+    target_link_libraries(fm3 PRIVATE dbghelp bcrypt winmm)
 endif()
 
 # --- Launcher -----------------------------------------------------------------
@@ -95,6 +108,16 @@ add_custom_command(TARGET fm3-launcher POST_BUILD
         $<TARGET_FILE_DIR:fm3-launcher>)
 
 # --- Tools --------------------------------------------------------------------
+
+# FM3-dual-monitor: optional display-only companion that shows each player's
+# split-screen view on its own monitor (DWM thumbnails of the game window).
+# Started by the game when dual_monitor_autostart = true.
+if(WIN32)
+    add_executable(fm3-dual-monitor WIN32 tools/fm3-dual-monitor/dual_monitor.cpp)
+    target_compile_definitions(fm3-dual-monitor PRIVATE UNICODE _UNICODE)
+    target_link_libraries(fm3-dual-monitor PRIVATE user32 gdi32 dwmapi)
+    set_target_properties(fm3-dual-monitor PROPERTIES OUTPUT_NAME FM3-dual-monitor)
+endif()
 
 add_executable(fm3tool tools/fm3tool/main.cpp)
 target_link_libraries(fm3tool PRIVATE rex::runtime rex::kernel rex::system)
