@@ -1,0 +1,2206 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b3e7c1223a54ffec80d607b9484e20887d..82417402c93ec0aa9f7664a875c427687695285c 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -380,6 +380,10 @@ class D3D12CommandProcessor : public CommandProcessor {
+     uint32_t written_size[2] = {0, 0};
+     uint32_t current_index = 0;
+     uint64_t last_used_frame = 0;
++    // FM3 research build: frames in a row this resolve was repeated, and
++    // whether its read-back was skipped since the CPU last got its data.
++    uint32_t streak = 0;
++    bool skipped_since_read = false;
+   };
+   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
+@@ -658,7 +662,21 @@ class D3D12CommandProcessor : public CommandProcessor {
+     uint32_t sample_count_address = 0;
+     uint32_t host_index = UINT32_MAX;
+     bool valid = false;
++    // Already ended on the host because its command list was submitted.
++    bool closed = false;
+   } active_occlusion_query_;
++  struct PendingOcclusionTile {
++    uint32_t address;
++    uint32_t host_index;
++  };
++  std::vector<PendingOcclusionTile> occlusion_pending_tiles_;
++  void FinishOcclusionTile(uint32_t sample_count_address);
++  uint64_t occlusion_queries_cut_ = 0;
++  uint64_t occlusion_queries_real_ = 0;
++  uint64_t occlusion_queries_overlapped_ = 0;
++  uint64_t occlusion_queries_unmatched_ = 0;
++  uint32_t occlusion_events_logged_ = 0;
++  uint64_t occlusion_results_total_ = 0;
+   struct VertexBufferState {
+     uint32_t address = UINT32_MAX;
+     uint32_t size = UINT32_MAX;
+diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
+index 7f1eb7f72ea010e23c17b803c6b37a92af75d55e..03fe3b3290065f7c7cc4215fcb49d2bb795a8890 100644
+--- a/include/rex/graphics/d3d12/deferred_command_list.h
++++ b/include/rex/graphics/d3d12/deferred_command_list.h
+@@ -34,6 +34,16 @@ class DeferredCommandList {
+ 
+   void Reset();
+   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
++  // FM3 research build: replay a stream that was taken out of the list, so it
++  // can be done on another thread while new commands are being written.
++  void ExecuteStream(const uintmax_t* stream, size_t stream_remaining,
++                     ID3D12GraphicsCommandList* command_list,
++                     ID3D12GraphicsCommandList1* command_list_1) const;
++  // Moves the written commands into `out` (whose old storage is reused here).
++  void TakeStream(std::vector<uintmax_t>& out) {
++    out.swap(command_stream_);
++    command_stream_.clear();
++  }
+ 
+   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
+                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a74437566e952ee32ffc2761bed766aa3ba0c45e..5eb5fa94b4598d7be8e7c25dda7a5787562a9f5a 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include "fm3_stats.h"
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+@@ -217,6 +218,7 @@ void CommandProcessor::WorkerThreadMain() {
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
+       PrepareForWait();
++      fm3stats::Scope fm3_idle_scope(fm3stats::idle_no_commands);
+       uint32_t loop_count = 0;
+       do {
+         // If we spin around too much, revert to a "low-power" state.
+@@ -355,9 +357,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
+-    REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+-  }
++  // FM3 research build: the "unknown register" debug note was removed from
++  // here; looking the register up cost time on every single write.
+ 
+   // Scratch register writeback.
+   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+@@ -702,6 +703,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t base_index = (packet & 0x7FFF);
+   uint32_t write_one_reg = (packet >> 15) & 0x1;
++  if (!write_one_reg) {
++    // FM3 research build: write the whole run in one call instead of one
++    // virtual call per register (same change as the earlier binary patch).
++    WriteRegisterRangeFromRing(reader, base_index, count);
++    return true;
++  }
+   for (uint32_t m = 0; m < count; m++) {
+     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+@@ -1033,6 +1040,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
++        fm3stats::Scope fm3_idle_scope(fm3stats::idle_vblank);
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index ac998a2f362aea2ccf4cea7c0d9e2ea51ad3c19d..fb6558d801ab1f60ec9254a6cd35939da4c4a044 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -9,12 +9,18 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <algorithm>
+ #include <cstdarg>
++#include <cstdio>
+ #include <cstring>
+ #include <sstream>
+ #include <utility>
+ 
++#include "../fm3_stats.h"
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+@@ -43,12 +49,180 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// FM3 research build. With readback_resolve = "fast" the CPU gets the data of
++// the previous resolve to the same address, which is fine for something
++// resolved every frame and wrong for a one-off (a car photo starts out as the
++// previous car's picture). A resolve whose address was not resolved within
++// this many frames is read back immediately instead. 0 disables it.
++REXCVAR_DEFINE_INT32(readback_resolve_sync_after_frames, 0, "GPU",
++                     "Fast readback: wait for the data when the same resolve was last done more "
++                     "than this many frames ago (0 = never)")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// FM3 research build. Something resolved every single frame (the screen,
++// shadow and reflection targets) is used on the graphics card only; copying
++// it back to game memory every frame is wasted work. Once the same resolve
++// has repeated this many frames in a row its read-back stops until the run is
++// broken. One-off resolves (car photos) are never affected. 0 disables it.
++REXCVAR_DEFINE_INT32(readback_resolve_stream_skip_after_frames, 0, "GPU",
++                     "Stop reading back a resolve repeated this many frames in a row (0 = never)")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(readback_resolve_stream_skip_min_bytes, 0x200000, "GPU",
++                     "Only resolves at least this large are affected by the stream skip")
++    .range(0, 0x40000000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// FM3 research build, diagnostic: write the bytes of every resolve handed to
++// the CPU into this folder (first 600), named with address, size, pitch,
++// height and format, to see at which step a picture goes wrong.
++REXCVAR_DEFINE_STRING(readback_resolve_dump_dir, "", "GPU",
++                      "Diagnostic: folder to dump read-back resolve data into (empty = off)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// FM3 research build, diagnostic.
++REXCVAR_DEFINE_BOOL(gpu_workload_stats, false, "GPU",
++                    "Diagnostic: log what the graphics thread did every 300 frames")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// FM3 research build. Handing the finished commands of a submission to the
++// graphics driver was about a quarter of the graphics thread's work. With
++// this on, a second thread does it while the graphics thread goes on with the
++// next commands. Order is kept: one worker, first in first out, and the
++// graphics thread waits for it before the picture goes to the presenter.
++REXCVAR_DEFINE_BOOL(d3d12_async_submission, false, "GPU/D3D12",
++                    "Hand submissions to the driver on a second thread")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(d3d12_submission_split_draws, 0, "GPU/D3D12",
++                     "End the submission every this many draws (0 = never), so the second "
++                     "thread has work early in the frame")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics::d3d12 {
+ 
++namespace {
++// FM3 research build: see d3d12_async_submission.
++class Fm3SubmitWorker {
++ public:
++  struct Job {
++    std::vector<uintmax_t> stream;
++    ID3D12CommandAllocator* allocator = nullptr;
++    uint64_t submission = 0;
++  };
++
++  void Start(const DeferredCommandList* replayer, ID3D12GraphicsCommandList* list,
++             ID3D12GraphicsCommandList1* list_1, ID3D12CommandQueue* queue, ID3D12Fence* fence) {
++    Stop();
++    replayer_ = replayer;
++    list_ = list;
++    list_1_ = list_1;
++    queue_ = queue;
++    fence_ = fence;
++    stop_ = false;
++    thread_ = std::thread([this] { Main(); });
++  }
++
++  void Stop() {
++    if (!thread_.joinable()) {
++      return;
++    }
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      stop_ = true;
++    }
++    work_.notify_all();
++    thread_.join();
++  }
++
++  bool running() const { return thread_.joinable(); }
++
++  // Storage for the next stream, reusing a finished job's allocation.
++  std::vector<uintmax_t> TakeSpare() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    std::vector<uintmax_t> spare;
++    if (!spares_.empty()) {
++      spare = std::move(spares_.back());
++      spares_.pop_back();
++    }
++    return spare;
++  }
++
++  void Push(Job&& job) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    // Never let the graphics thread run far ahead of the driver.
++    done_.wait(lock, [this] { return jobs_.size() < 3; });
++    jobs_.push_back(std::move(job));
++    lock.unlock();
++    work_.notify_one();
++  }
++
++  // Returns once everything pushed so far is on the queue.
++  void Flush() {
++    if (!thread_.joinable()) {
++      return;
++    }
++    std::unique_lock<std::mutex> lock(mutex_);
++    done_.wait(lock, [this] { return jobs_.empty() && !busy_; });
++  }
++
++ private:
++  void Main() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    while (true) {
++      work_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
++      if (jobs_.empty()) {
++        return;
++      }
++      Job job = std::move(jobs_.front());
++      jobs_.pop_front();
++      busy_ = true;
++      lock.unlock();
++      done_.notify_all();
++      {
++        fm3stats::Scope scope(fm3stats::submit_worker);
++        job.allocator->Reset();
++        list_->Reset(job.allocator, nullptr);
++        replayer_->ExecuteStream(job.stream.data(), job.stream.size(), list_, list_1_);
++        list_->Close();
++        ID3D12CommandList* lists[] = {list_};
++        queue_->ExecuteCommandLists(1, lists);
++        queue_->Signal(fence_, job.submission);
++      }
++      job.stream.clear();
++      lock.lock();
++      if (spares_.size() < 4) {
++        spares_.push_back(std::move(job.stream));
++      }
++      busy_ = false;
++      done_.notify_all();
++    }
++  }
++
++  std::thread thread_;
++  std::mutex mutex_;
++  std::condition_variable work_, done_;
++  std::deque<Job> jobs_;
++  std::vector<std::vector<uintmax_t>> spares_;
++  bool busy_ = false;
++  bool stop_ = false;
++  const DeferredCommandList* replayer_ = nullptr;
++  ID3D12GraphicsCommandList* list_ = nullptr;
++  ID3D12GraphicsCommandList1* list_1_ = nullptr;
++  ID3D12CommandQueue* queue_ = nullptr;
++  ID3D12Fence* fence_ = nullptr;
++};
++Fm3SubmitWorker fm3_submit_worker;
++uint32_t fm3_draws_in_submission = 0;
++}  // namespace
++
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_cs.h"
+@@ -165,7 +339,6 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+   auto* sample_counts =
+       memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
+   if (!sample_counts) {
+-    DisableHostOcclusionQueries();
+     return true;
+   }
+ 
+@@ -192,12 +365,45 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+       sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
+   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
+ 
++  // FM3 research build: work like the hardware instead of assuming one query
++  // at a time. Every ZPASS_DONE event closes the counting that is going on and
++  // (for a begin) starts a new one, so an end reports the samples since the
++  // last event, whichever query that was. FM3 begins a new query while the
++  // previous one is still open (seen 2026-11-15), which used to turn host
++  // queries off for good and made the sun glare always full strength.
++  if (occlusion_events_logged_ < 12) {
++    ++occlusion_events_logged_;
++    REXGPU_WARN("FM3: occlusion event {} at {:08X} | open query {}{:08X}", is_end ? "END" : "begin",
++                sample_count_addr, active_occlusion_query_.valid ? "at " : "none ",
++                active_occlusion_query_.sample_count_address);
++  }
++
++  // How the Xbox 360 D3D uses this (FM3 GetData 824C5F28, Issue 824C5D38):
++  // a query is a list of 64-byte entries, one per predicated tile. In each
++  // entry the "after" counts are at +0x00 and the "before" counts at +0x20;
++  // ZPASS_DONE dumps the counts to +0x20 when the tile starts and to +0x00
++  // when it ends, and the result is the sum over tiles of after - before.
++  // Only the LAST entry gets the 0xFFFFFEED marker, so the ends of the other
++  // tiles look like begins. Pair them by address instead: an event 0x20
++  // below the open one ends that tile. Each tile's count is resolved, and all
++  // are written to guest memory together when the marked end arrives.
+   if (!is_end) {
+     if (active_occlusion_query_.valid &&
+-        active_occlusion_query_.sample_count_address != sample_count_addr) {
+-      DisableHostOcclusionQueries();
+-      return write_fallback_result();
++        sample_count_addr + 0x20 == active_occlusion_query_.sample_count_address) {
++      FinishOcclusionTile(sample_count_addr);
++      return true;
+     }
++    if (active_occlusion_query_.valid) {
++      ++occlusion_queries_overlapped_;
++      if (!active_occlusion_query_.closed && BeginSubmission(true)) {
++        deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                           active_occlusion_query_.host_index);
++      }
++      active_occlusion_query_ = {};
++    }
++    // The "before" counts are zero, so after - before is what is written at
++    // the end.
++    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
+     if (!BeginGuestOcclusionQuery(sample_count_addr)) {
+       return write_fallback_result();
+     }
+@@ -205,18 +411,42 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+   }
+ 
+   if (!active_occlusion_query_.valid ||
+-      active_occlusion_query_.sample_count_address != sample_count_addr) {
+-    DisableHostOcclusionQueries();
++      sample_count_addr + 0x20 != active_occlusion_query_.sample_count_address) {
++    // An end with no matching begin: answer this one query with the fallback
++    // and keep real queries on.
++    ++occlusion_queries_unmatched_;
++    occlusion_pending_tiles_.clear();
+     return write_fallback_result();
+   }
+ 
+   if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
++    occlusion_pending_tiles_.clear();
+     return write_fallback_result();
+   }
+ 
+   return true;
+ }
+ 
++void D3D12CommandProcessor::FinishOcclusionTile(uint32_t sample_count_address) {
++  const uint32_t host_index = active_occlusion_query_.host_index;
++  const bool closed = active_occlusion_query_.closed;
++  active_occlusion_query_ = {};
++  if (!BeginSubmission(true)) {
++    return;
++  }
++  if (!closed) {
++    deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                       host_index);
++  }
++  deferred_command_list_.D3DResolveQueryData(occlusion_query_heap_.Get(),
++                                             D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
++                                             occlusion_query_readback_.Get(),
++                                             sizeof(uint64_t) * host_index);
++  if (occlusion_pending_tiles_.size() < 64) {
++    occlusion_pending_tiles_.push_back({sample_count_address, host_index});
++  }
++}
++
+ bool D3D12CommandProcessor::PushTransitionBarrier(ID3D12Resource* resource,
+                                                   D3D12_RESOURCE_STATES old_state,
+                                                   D3D12_RESOURCE_STATES new_state,
+@@ -905,6 +1135,11 @@ bool D3D12CommandProcessor::SetupContext() {
+   command_list_->Close();
+   // Optional - added in Creators Update (SDK 10.0.15063.0).
+   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
++  if (REXCVAR_GET(d3d12_async_submission)) {
++    fm3_submit_worker.Start(&deferred_command_list_, command_list_, command_list_1_, direct_queue,
++                            submission_fence_);
++    REXGPU_WARN("FM3: submissions are handed to the driver on a second thread");
++  }
+ 
+   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
+                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
+@@ -1737,6 +1972,7 @@ void D3D12CommandProcessor::ShutdownContext() {
+ 
+   shared_memory_.reset();
+ 
++  fm3_submit_worker.Stop();
+   deferred_command_list_.Reset();
+   ui::d3d12::util::ReleaseAndNull(command_list_1_);
+   ui::d3d12::util::ReleaseAndNull(command_list_);
+@@ -1880,6 +2116,14 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
+     return;
+   }
+ 
++  // FM3 research build: the render state registers (0x2000-0x3FFF) have no
++  // side effects when written, neither here nor in the base class, so a run
++  // of them is stored directly instead of one virtual call per register.
++  if (start_index >= 0x2000 && end_index < XE_GPU_REG_SHADER_CONSTANT_000_X) {
++    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
++    return;
++  }
++
+   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+ }
+ 
+@@ -1894,6 +2138,71 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  if (REXCVAR_GET(gpu_workload_stats)) {
++    static uint32_t fm3_frames = 0;
++    if (++fm3_frames >= 300) {
++      fm3_frames = 0;
++      const auto take = [](fm3stats::Counter& c, uint64_t& count) {
++        count = c.count.exchange(0);
++        return double(c.ns.exchange(0)) / 1e6;
++      };
++      uint64_t n_tex, n_pipe, n_up, n_res, n_mem, n_draw, n_copy;
++      const double ms_tex = take(fm3stats::texture_loads, n_tex);
++      const double ms_pipe = take(fm3stats::pipeline_creates, n_pipe);
++      const double ms_up = take(fm3stats::memory_uploads, n_up);
++      const double ms_res = take(fm3stats::resolve_waits, n_res);
++      const double ms_mem = take(fm3stats::memexport_waits, n_mem);
++      take(fm3stats::draws, n_draw);
++      take(fm3stats::copies, n_copy);
++      uint64_t n_skip, n_up_bytes;
++      take(fm3stats::readback_skips, n_skip);
++      take(fm3stats::upload_bytes, n_up_bytes);
++      uint64_t n_sub, n_flush, n_worker;
++      take(fm3stats::submissions, n_sub);
++      const double ms_flush = take(fm3stats::submit_flush_waits, n_flush);
++      const double ms_worker = take(fm3stats::submit_worker, n_worker);
++      uint64_t n_occl;
++      const double ms_occl = take(fm3stats::occlusion_waits, n_occl);
++      REXGPU_WARN(
++          "gpu extras per 300 frames: readbacks skipped {} | uploaded {} KB | submissions {} | "
++          "second thread {:.2f} ms/frame | waited for it {:.2f} ms/frame | occlusion queries "
++          "{} real ({:.2f} ms/frame waiting), {} overlapped, {} cut, {} unmatched, host {}",
++          n_skip, n_up_bytes >> 10, n_sub, ms_worker / 300.0, ms_flush / 300.0,
++          std::exchange(occlusion_queries_real_, 0), ms_occl / 300.0,
++          std::exchange(occlusion_queries_overlapped_, 0), occlusion_queries_cut_,
++          std::exchange(occlusion_queries_unmatched_, 0),
++          occlusion_query_resources_available_ ? "on" : "OFF");
++      {
++        std::string fm3_map;
++        for (uint32_t mb = 0; mb < 512; ++mb) {
++          const uint32_t kb = fm3stats::upload_kb_by_mb[mb].exchange(0);
++          const uint32_t n = fm3stats::upload_count_by_mb[mb].exchange(0);
++          if (kb >= 3000) {
++            fm3_map += fmt::format(" {:03X}:{}M/{}", mb, kb >> 10, n);
++          }
++        }
++        REXGPU_WARN("gpu uploads by MB of game memory (MB:size/count):{}", fm3_map);
++      }
++      uint64_t n_idle_v, n_idle_c;
++      const double ms_idle_v = take(fm3stats::idle_vblank, n_idle_v);
++      const double ms_idle_c = take(fm3stats::idle_no_commands, n_idle_c);
++      static auto fm3_last = std::chrono::steady_clock::now();
++      const auto fm3_now = std::chrono::steady_clock::now();
++      const double ms_wall = std::chrono::duration<double, std::milli>(fm3_now - fm3_last).count();
++      fm3_last = fm3_now;
++      REXGPU_WARN(
++          "gpu frame time over 300 frames: wall {:.2f} ms | busy {:.2f} ms | vblank wait {:.2f} ms "
++          "| no commands {:.2f} ms",
++          ms_wall / 300.0, (ms_wall - ms_idle_v - ms_idle_c) / 300.0, ms_idle_v / 300.0,
++          ms_idle_c / 300.0);
++      REXGPU_WARN(
++          "gpu workload per 300 frames: draws {} | resolves {} | texture loads {} ({:.0f} ms) | "
++          "pipelines created {} ({:.0f} ms) | memory uploads {} ({:.0f} ms) | resolve waits {} "
++          "({:.0f} ms) | memexport waits {} ({:.0f} ms)",
++          n_draw, n_copy, n_tex, ms_tex, n_pipe, ms_pipe, n_up, ms_up, n_res, ms_res, n_mem,
++          ms_mem);
++    }
++  }
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -2271,6 +2580,17 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                                       IndexBufferInfo* index_buffer_info,
+                                       bool major_mode_explicit) {
++  fm3stats::draws.count.fetch_add(1, std::memory_order_relaxed);
++  {
++    const int32_t fm3_split = REXCVAR_GET(d3d12_submission_split_draws);
++    // Never split inside an occlusion query: a D3D12 query must begin and end
++    // in one command list (the sun glare in FM3 is sized by such a query).
++    if (fm3_split > 0 && ++fm3_draws_in_submission >= uint32_t(fm3_split) && submission_open_ &&
++        !active_occlusion_query_.valid && fm3_submit_worker.running() &&
++        CanEndSubmissionImmediately()) {
++      EndSubmission(false);
++    }
++  }
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -2751,6 +3071,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
+     readback_buffer_offset += memexport_range.size_bytes;
+   }
+ 
++  fm3stats::Scope fm3_scope(fm3stats::memexport_waits);
+   if (!AwaitAllQueueOperationsCompletion()) {
+     return true;
+   }
+@@ -2809,6 +3130,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+     }
+ 
+     if (readback.buffers[index]) {
++      fm3stats::Scope fm3_scope(fm3stats::memexport_waits);
+       if (!AwaitAllQueueOperationsCompletion()) {
+         buffer->Unmap(0, nullptr);
+         buffer->Release();
+@@ -2871,6 +3193,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+ }
+ 
+ bool D3D12CommandProcessor::IssueCopy() {
++  fm3stats::copies.count.fetch_add(1, std::memory_order_relaxed);
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -2904,8 +3227,37 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+   ReadbackBuffer& rb = readback_buffers_[resolve_key];
++  const uint64_t readback_previous_frame = rb.last_used_frame;
+   rb.last_used_frame = frame_current_;
+ 
++  if (frame_current_ != readback_previous_frame) {
++    rb.streak = (frame_current_ - readback_previous_frame <= 2) ? rb.streak + 1 : 0;
++  }
++  const int32_t stream_skip = REXCVAR_GET(readback_resolve_stream_skip_after_frames);
++  // The 16:16 shadow maps are left alone: the followed car's shadow turned
++  // into a box when their read-back was skipped.
++  if (stream_skip > 0 && rb.streak == uint32_t(stream_skip)) {
++    static uint32_t stream_notes = 0;
++    if (stream_notes < 300) {
++      ++stream_notes;
++      const auto note_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
++      REXGPU_WARN("Readback stream {:08X}+{:X} format {} pitch {} height {}", written_address,
++                  written_length,
++                  uint32_t(register_file_->Get<reg::RB_COPY_DEST_INFO>().copy_dest_format),
++                  uint32_t(note_pitch.copy_dest_pitch), uint32_t(note_pitch.copy_dest_height));
++    }
++  }
++  if (stream_skip > 0 && rb.streak >= uint32_t(stream_skip) &&
++      written_length >= uint32_t(REXCVAR_GET(readback_resolve_stream_skip_min_bytes)) &&
++      uint32_t(register_file_->Get<reg::RB_COPY_DEST_INFO>().copy_dest_format) !=
++          uint32_t(xenos::TextureFormat::k_16_16)) {
++    rb.skipped_since_read = true;
++    fm3stats::readback_skips.count.fetch_add(1, std::memory_order_relaxed);
++    return true;
++  }
++  const bool readback_resume_after_skip = rb.skipped_since_read;
++  rb.skipped_since_read = false;
++
+   uint32_t write_index = rb.current_index;
+   uint32_t size = AlignReadbackBufferSize(written_length);
+ 
+@@ -2922,6 +3274,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+       return true;
+     }
+     if (rb.buffers[write_index]) {
++      // A stream still waiting for the second thread may name the old buffer.
++      fm3_submit_worker.Flush();
+       if (rb.mapped_data[write_index]) {
+         rb.buffers[write_index]->Unmap(0, nullptr);
+         rb.mapped_data[write_index] = nullptr;
+@@ -3007,7 +3361,16 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     if (scaled_address < scaled_buffer_base) {
+       return true;
+     }
+-    uint64_t source_offset = scaled_address - scaled_buffer_base;
++    // FM3 research build: the current range starts at the texture's base,
++    // while the data read back starts at the first written tile.
++    const uint64_t scale_area = uint64_t(texture_cache_->draw_resolution_scale_x()) *
++                                texture_cache_->draw_resolution_scale_y();
++    const uint64_t written_scaled = uint64_t(written_address) * scale_area;
++    if (written_scaled < scaled_address || written_scaled - scaled_address >= scaled_length) {
++      return true;
++    }
++    scaled_length -= uint32_t(written_scaled - scaled_address);
++    uint64_t source_offset = written_scaled - scaled_buffer_base;
+ 
+     ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
+     if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
+@@ -3075,15 +3438,40 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   uint32_t read_index = write_index;
+   if (use_delayed_sync) {
+     read_index = 1 - write_index;
+-  } else if (!AwaitAllQueueOperationsCompletion()) {
++  } else if (fm3stats::Scope fm3_scope(fm3stats::resolve_waits);
++             !AwaitAllQueueOperationsCompletion()) {
+     return true;
+   }
+ 
+   bool is_cache_miss = false;
+-  if (use_delayed_sync && (!rb.buffers[read_index] || written_length > rb.sizes[read_index] ||
+-                           !rb.mapped_data[read_index])) {
++  const int32_t sync_after = REXCVAR_GET(readback_resolve_sync_after_frames);
++  const bool is_stale = use_delayed_sync && sync_after > 0 &&
++                        frame_current_ - readback_previous_frame > uint64_t(sync_after);
++  if (is_stale) {
++    // First few in detail, then one count every 600 frames, so a race that
++    // waits often shows up in the log without flooding it.
++    static uint32_t stale_notes = 0;
++    static uint32_t stale_in_window = 0;
++    static uint64_t stale_window_start = 0;
++    if (stale_notes < 60) {
++      ++stale_notes;
++      REXGPU_WARN("Readback resolve {:08X}+{:X}: last done {} frames ago, reading it now",
++                  written_address, written_length, frame_current_ - readback_previous_frame);
++    }
++    ++stale_in_window;
++    if (frame_current_ - stale_window_start >= 600) {
++      REXGPU_WARN("Readback resolve: {} immediate reads in the last {} frames (latest {:08X}+{:X})",
++                  stale_in_window, frame_current_ - stale_window_start, written_address,
++                  written_length);
++      stale_in_window = 0;
++      stale_window_start = frame_current_;
++    }
++  }
++  if (use_delayed_sync && (is_stale || readback_resume_after_skip || !rb.buffers[read_index] ||
++                           written_length > rb.sizes[read_index] || !rb.mapped_data[read_index])) {
+     is_cache_miss = true;
+     read_index = write_index;
++    fm3stats::Scope fm3_scope(fm3stats::resolve_waits);
+     if (!AwaitAllQueueOperationsCompletion()) {
+       return true;
+     }
+@@ -3095,6 +3483,34 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     uint8_t* destination = memory_->TranslatePhysical(written_address);
+     if (destination) {
+       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
++      const std::string dump_dir = REXCVAR_GET(readback_resolve_dump_dir);
++      static uint32_t dump_count = 0;
++      // Things resolved every frame are skipped; the newest 800 are kept.
++      if (!dump_dir.empty() && frame_current_ - readback_previous_frame > 3) {
++        const auto dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
++        const auto dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
++        char name[256];
++        std::snprintf(name, sizeof(name),
++                      "%s/%03u.bin", dump_dir.c_str(), dump_count % 800);
++        char note[256];
++        std::snprintf(note, sizeof(note),
++                      "%03u n%u f%llu a%08X l%X base%08X p%u h%u fmt%u end%u %s\n",
++                      dump_count % 800, dump_count,
++                      static_cast<unsigned long long>(frame_current_), written_address,
++                      written_length, (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE],
++                      uint32_t(dest_pitch.copy_dest_pitch), uint32_t(dest_pitch.copy_dest_height),
++                      uint32_t(dest_info.copy_dest_format), uint32_t(dest_info.copy_dest_endian),
++                      read_index == write_index ? "now" : "prev");
++        if (FILE* file = std::fopen(name, "wb")) {
++          std::fwrite(destination, 1, written_length, file);
++          std::fclose(file);
++          ++dump_count;
++          if (FILE* index = std::fopen((dump_dir + "/index.txt").c_str(), "ab")) {
++            std::fputs(note, index);
++            std::fclose(index);
++          }
++        }
++      }
+     }
+   }
+ 
+@@ -3402,10 +3818,15 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+   if (submission_open_) {
+     assert_false(scratch_buffer_used_);
+ 
+-    if (active_occlusion_query_.valid && occlusion_query_heap_) {
++    if (active_occlusion_query_.valid && !active_occlusion_query_.closed &&
++        occlusion_query_heap_) {
+       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                          active_occlusion_query_.host_index);
+-      active_occlusion_query_ = {};
++      // FM3 research build: a query must end in the command list it began in.
++      // Keep it open for the guest as "closed": its end resolves what was
++      // counted up to here instead of turning host queries off.
++      active_occlusion_query_.closed = true;
++      ++occlusion_queries_cut_;
+     }
+ 
+     pipeline_cache_->EndSubmission();
+@@ -3423,12 +3844,30 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // happens between Xenia submissions.
+     ID3D12CommandAllocator* command_allocator =
+         command_allocator_writable_first_->command_allocator;
+-    command_allocator->Reset();
+-    command_list_->Reset(command_allocator, nullptr);
+-    deferred_command_list_.Execute(command_list_, command_list_1_);
+-    command_list_->Close();
+-    ID3D12CommandList* execute_command_lists[] = {command_list_};
+-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    fm3stats::submissions.count.fetch_add(1, std::memory_order_relaxed);
++    fm3_draws_in_submission = 0;
++    const bool fm3_async = fm3_submit_worker.running();
++    if (fm3_async) {
++      Fm3SubmitWorker::Job job;
++      job.stream = fm3_submit_worker.TakeSpare();
++      deferred_command_list_.TakeStream(job.stream);
++      job.allocator = command_allocator;
++      job.submission = submission_current_;
++      fm3_submit_worker.Push(std::move(job));
++      if (is_swap) {
++        // The presenter draws the picture with its own commands on the same
++        // queue right after this, so everything must be on the queue first.
++        fm3stats::Scope fm3_scope(fm3stats::submit_flush_waits);
++        fm3_submit_worker.Flush();
++      }
++    } else {
++      command_allocator->Reset();
++      command_list_->Reset(command_allocator, nullptr);
++      deferred_command_list_.Execute(command_list_, command_list_1_);
++      command_list_->Close();
++      ID3D12CommandList* execute_command_lists[] = {command_list_};
++      direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    }
+     command_allocator_writable_first_->last_usage_submission = submission_current_;
+     if (command_allocator_submitted_last_) {
+       command_allocator_submitted_last_->next = command_allocator_writable_first_;
+@@ -3442,7 +3881,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+       command_allocator_writable_last_ = nullptr;
+     }
+ 
+-    direct_queue->Signal(submission_fence_, submission_current_++);
++    if (fm3_async) {
++      ++submission_current_;
++    } else {
++      direct_queue->Signal(submission_fence_, submission_current_++);
++    }
+ 
+     submission_open_ = false;
+ 
+@@ -4880,7 +5323,8 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
+ }
+ 
+ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
+-  if (active_occlusion_query_.valid && occlusion_query_heap_) {
++  occlusion_pending_tiles_.clear();
++  if (active_occlusion_query_.valid && !active_occlusion_query_.closed && occlusion_query_heap_) {
+     uint32_t host_index = active_occlusion_query_.host_index;
+     // Clear before EndSubmission to prevent the EndSubmission safety net from issuing a second
+     // EndQuery for the same index.
+@@ -4932,14 +5376,17 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
+   }
+ 
+   uint32_t host_index = active_occlusion_query_.host_index;
++  const bool closed = active_occlusion_query_.closed;
+   active_occlusion_query_ = {};
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+ 
+-  deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+-                                     host_index);
++  if (!closed) {
++    deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                       host_index);
++  }
+   deferred_command_list_.D3DResolveQueryData(
+       occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
+       occlusion_query_readback_.Get(), sizeof(uint64_t) * host_index);
+@@ -4949,7 +5396,10 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
+   }
+ 
+   uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
+-  CheckSubmissionFence(query_submission);
++  {
++    fm3stats::Scope fm3_scope(fm3stats::occlusion_waits);
++    CheckSubmissionFence(query_submission);
++  }
+   if (submission_completed_ < query_submission) {
+     return false;
+   }
+@@ -4958,8 +5408,27 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
+   }
+ 
+   uint64_t samples = occlusion_query_readback_mapping_[host_index];
++  // The earlier tiles of this query (see ExecutePacketType3_EVENT_WRITE_ZPD).
++  std::string fm3_tiles;
++  for (const auto& tile : occlusion_pending_tiles_) {
++    auto* tile_counts =
++        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(tile.address);
++    const uint64_t tile_samples =
++        NormalizeOcclusionSamples(occlusion_query_readback_mapping_[tile.host_index]);
++    if (tile_counts) {
++      WriteGuestOcclusionResult(tile_counts, tile_samples);
++    }
++    fm3_tiles += fmt::format("{} + ", tile_samples);
++  }
++  occlusion_pending_tiles_.clear();
+   samples = NormalizeOcclusionSamples(samples);
+   WriteGuestOcclusionResult(sample_counts, samples);
++  ++occlusion_queries_real_;
++  ++occlusion_results_total_;
++  if (occlusion_results_total_ <= 20 || (occlusion_results_total_ % 600) == 0) {
++    REXGPU_WARN("FM3: occlusion result {}: {}{} samples", occlusion_results_total_, fm3_tiles,
++                samples);
++  }
+   return true;
+ }
+ 
+diff --git a/src/graphics/d3d12/deferred_command_list.cpp b/src/graphics/d3d12/deferred_command_list.cpp
+index e6d6277c2b5eb98dce6f5bc7137eb3c033aadf9a..36f28e92c5372c37370fd145ebfedd9a9e1f7b47 100644
+--- a/src/graphics/d3d12/deferred_command_list.cpp
++++ b/src/graphics/d3d12/deferred_command_list.cpp
+@@ -33,8 +33,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+-  const uintmax_t* stream = command_stream_.data();
+-  size_t stream_remaining = command_stream_.size();
++  ExecuteStream(command_stream_.data(), command_stream_.size(), command_list, command_list_1);
++}
++
++void DeferredCommandList::ExecuteStream(const uintmax_t* stream, size_t stream_remaining,
++                                        ID3D12GraphicsCommandList* command_list,
++                                        ID3D12GraphicsCommandList1* command_list_1) const {
+   ID3D12PipelineState* current_pipeline_state = nullptr;
+   while (stream_remaining != 0) {
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 8e6b854b28f92d2d128c1e70080e44750329b12f..a035c6a1968a0db0e65135ca334a47265c2a1a76 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "../fm3_stats.h"
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+@@ -2677,6 +2678,7 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey
+ 
+ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
+     const PipelineRuntimeDescription& runtime_description) {
++  fm3stats::Scope fm3_scope(fm3stats::pipeline_creates);
+   const PipelineDescription& description = runtime_description.description;
+ 
+   if (runtime_description.pixel_shader != nullptr) {
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index a5c97a05fb0f98e0fbcaa5e48de70558506d019d..c7f431941bd0ad0ecdd7efed9446992038ae023c 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "../fm3_stats.h"
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+@@ -306,6 +307,7 @@ bool D3D12SharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  fm3stats::Scope fm3_scope(fm3stats::memory_uploads);
+   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+   command_processor_.SubmitBarriers();
+   auto& command_list = command_processor_.GetDeferredCommandList();
+@@ -330,6 +332,15 @@ bool D3D12SharedMemory::UploadRanges(
+       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
+                                        upload_buffer, UINT64(upload_buffer_offset),
+                                        UINT64(upload_buffer_size));
++      fm3stats::upload_bytes.count.fetch_add(upload_buffer_size, std::memory_order_relaxed);
++      {
++        const uint32_t fm3_mb = (upload_range_start << page_size_log2()) >> 20;
++        if (fm3_mb < 512) {
++          fm3stats::upload_kb_by_mb[fm3_mb].fetch_add(uint32_t(upload_buffer_size >> 10),
++                                                      std::memory_order_relaxed);
++          fm3stats::upload_count_by_mb[fm3_mb].fetch_add(1, std::memory_order_relaxed);
++        }
++      }
+       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+       upload_range_length -= upload_buffer_pages;
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index fce0db076208766b9154da47cb74686fb01f34cd..7f0567526cbbef2e5a8cc945db8fe3275b6a2b42 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -17,6 +17,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "../fm3_stats.h"
+ #include <rex/assert.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+@@ -995,8 +996,13 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
+                                         ? fetch.aniso_filter
+                                         : binding.aniso_filter;
+   int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
++  // FM3 research build: only where the game itself blends between mip levels.
++  // Anisotropic filtering always blends them, and FM3 keeps two different
++  // pictures in the mip levels of a car thumbnail (angled view, side view)
++  // and samples it with a point mip filter; forcing the override there showed
++  // the side view as a ghost over the angled one.
+   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips && !mip_base_map &&
+-      min_mag_linear && mip_filter_bilinear_or_trilinear) {
++      min_mag_linear && mip_filter == xenos::TextureFilter::kLinear) {
+     aniso_filter = xenos::AnisoFilter(anisotropic_override);
+   }
+   aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
+@@ -1611,6 +1617,7 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+ 
+ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                               bool load_mips) {
++  fm3stats::Scope fm3_scope(fm3stats::texture_loads);
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
+ 
+diff --git a/src/graphics/fm3_stats.h b/src/graphics/fm3_stats.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..97e1f7e6356fa8e114c4137ea192cb6ed640ed49
+--- /dev/null
++++ b/src/graphics/fm3_stats.h
+@@ -0,0 +1,43 @@
++// FM3 research build: cheap counters for what the graphics thread spends its
++// time on, logged every 300 presented frames when gpu_workload_stats is on.
++#ifndef REX_GRAPHICS_FM3_STATS_H_
++#define REX_GRAPHICS_FM3_STATS_H_
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace rex::graphics::fm3stats {
++
++struct Counter {
++  std::atomic<uint64_t> count{0};
++  std::atomic<uint64_t> ns{0};
++};
++inline Counter texture_loads, pipeline_creates, memory_uploads, resolve_waits, memexport_waits,
++    draws, copies, idle_vblank, idle_no_commands, readback_skips, upload_bytes, submissions, submit_flush_waits, submit_worker, occlusion_waits;
++
++// Bytes uploaded from game memory per 1 MB of address space, and how many
++// uploads, to see which memory is re-sent every frame.
++inline std::atomic<uint32_t> upload_kb_by_mb[512];
++inline std::atomic<uint32_t> upload_count_by_mb[512];
++
++class Scope {
++ public:
++  explicit Scope(Counter& counter) : counter_(counter), start_(std::chrono::steady_clock::now()) {}
++  ~Scope() {
++    counter_.count.fetch_add(1, std::memory_order_relaxed);
++    counter_.ns.fetch_add(
++        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                     std::chrono::steady_clock::now() - start_)
++                     .count()),
++        std::memory_order_relaxed);
++  }
++
++ private:
++  Counter& counter_;
++  std::chrono::steady_clock::time_point start_;
++};
++
++}  // namespace rex::graphics::fm3stats
++
++#endif  // REX_GRAPHICS_FM3_STATS_H_
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h
+index dee703bba7f082b3a2c40448487f959ec44e2d40..d6b078cf036950f4eb03bf061785554a1de5987b 100644
+--- a/src/graphics/shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h
+@@ -45,7 +45,7 @@ dcl_resource_raw T0[0:0], space=0
+ dcl_uav_raw U0[0:0], space=0
+ dcl_input vThreadIDInGroupFlattened
+ dcl_input vThreadGroupID.x
+-dcl_temps 7
++dcl_temps 5
+ dcl_thread_group 128, 1, 1
+ uge r0.x, vThreadGroupID.x, CB0[0][0].w
+ if_nz r0.x
+@@ -64,130 +64,90 @@ else
+   mov r1.xy, l(0,0,0,0)
+ endif 
+ imul null, r0.z, r0.z, vThreadGroupID.x
+-ishl r1.zw, r0.xxxx, l(0, 0, 7, 6)
+-mov r2.x, vThreadIDInGroupFlattened.x
++mov r1.z, vThreadIDInGroupFlattened.x
+ loop 
+-  uge r2.y, r2.x, r0.w
+-  breakc_nz r2.y
+-  ishl r2.y, r2.x, l(2)
+-  imad r2.z, vThreadGroupID.x, r0.y, r2.y
+-  ieq r2.w, CB0[0][0].z, l(2)
+-  if_nz r2.w
+-    ubfe r3.xy, l(25, 30, 0, 0), l(5, 0, 0, 0), r2.xxxx
+-    and r2.w, r3.y, l(31)
+-    ubfe r3.z, l(2), l(3), r3.y
+-    bfi r4.x, l(30), l(2), r3.z, r3.y
+-    ubfe r4.y, l(1), l(2), r2.w
+-    imad r3.yz, r4.yyxy, CB0[0][0].yyxy, r1.yyxy
+-    ushr r4.xy, r3.zyzz, l(4, 1, 0, 0)
+-    imad r2.w, r4.x, CB0[0][0].y, r4.y
+-    bfi r3.yz, l(0, 1, 4, 0), l(0, 6, 2, 0), r3.yyzy, l(0, 0, 0, 0)
+-    bfi r2.w, l(25), l(7), r2.w, r3.y
+-    iadd r2.w, r2.w, r3.z
+-    imad r3.x, r3.x, r1.z, r0.z
+-    iadd r2.w, r2.w, r3.x
+-    ld_raw r2.w, r2.w, T0[0].xxxx
++  uge r1.w, r1.z, r0.w
++  breakc_nz r1.w
++  ishl r1.w, r1.z, l(2)
++  imad r2.x, vThreadGroupID.x, r0.y, r1.w
++  ieq r2.y, CB0[0][0].z, l(2)
++  if_nz r2.y
++    and r2.y, r1.w, l(-16)
++    ubfe r2.z, l(2), l(2), r1.w
++    imad r2.z, r2.z, CB0[0][0].x, r1.x
++    ushr r2.w, r2.z, l(2)
++    imad r2.w, r2.w, CB0[0][0].y, r1.y
++    bfi r2.z, l(2), l(2), r2.z, l(0)
++    imad r2.y, r2.y, r0.x, r0.z
++    ishl r2.w, r2.w, l(4)
++    iadd r2.y, r2.w, r2.y
++    iadd r2.y, r2.z, r2.y
++    ld_raw r2.y, r2.y, T0[0].xxxx
+   else 
+-    ieq r3.x, CB0[0][0].z, l(3)
+-    if_nz r3.x
+-      ubfe r3.xy, l(26, 29, 0, 0), l(4, 1, 0, 0), r2.xxxx
+-      and r3.z, r3.y, l(7)
+-      ubfe r3.w, l(1), l(2), r3.y
+-      bfi r4.x, l(31), l(1), r3.w, r3.y
+-      ubfe r4.y, l(1), l(1), r3.z
+-      imad r3.yz, r4.yyxy, CB0[0][0].yyxy, r1.yyxy
+-      ushr r4.xy, r3.zyzz, l(2, 1, 0, 0)
+-      imad r3.w, r4.x, CB0[0][0].y, r4.y
+-      bfi r3.yz, l(0, 1, 2, 0), l(0, 5, 3, 0), r3.yyzy, l(0, 0, 0, 0)
+-      bfi r3.y, l(26), l(6), r3.w, r3.y
+-      iadd r3.y, r3.y, r3.z
+-      imad r3.x, r3.x, r1.w, r0.z
+-      iadd r3.x, r3.y, r3.x
+-      bfi r3.y, l(1), l(2), r2.x, l(0)
+-      iadd r3.x, r3.y, r3.x
+-      ld_raw r2.w, r3.x, T0[0].xxxx
++    ieq r2.z, CB0[0][0].z, l(3)
++    if_nz r2.z
++      and r2.z, r1.w, l(-16)
++      ubfe r2.w, l(1), l(3), r1.w
++      imad r2.w, r2.w, CB0[0][0].x, r1.x
++      ushr r3.x, r2.w, l(1)
++      imad r3.x, r3.x, CB0[0][0].y, r1.y
++      bfi r2.w, l(1), l(3), r2.w, l(0)
++      imad r2.z, r2.z, r0.x, r0.z
++      ishl r3.x, r3.x, l(4)
++      iadd r2.z, r2.z, r3.x
++      iadd r2.z, r2.w, r2.z
++      bfi r2.w, l(1), l(2), r1.z, l(0)
++      iadd r2.z, r2.w, r2.z
++      ld_raw r2.y, r2.z, T0[0].xxxx
+     else 
+-      ushr r3.x, l(4), CB0[0][0].z
+-      ishl r3.yz, l(0, 1, 8, 0), CB0[0][0].zzzz
+-      mov r2.w, l(0)
+-      mov r3.w, l(0)
++      ushr r2.z, l(4), CB0[0][0].z
++      ishl r3.xy, l(1, 8, 0, 0), CB0[0][0].zzzz
++      mov r2.yw, l(0,0,0,0)
+       loop 
+-        uge r4.x, r3.w, r3.x
+-        breakc_nz r4.x
+-        imul null, r4.x, r3.z, r3.w
+-        imad r4.y, r3.w, r3.y, r2.y
+-        uge r4.z, l(2), CB0[0][0].z
+-        movc r4.zw, r4.zzzz, l(0,0,7,128), l(0,0,6,64)
+-        ushr r5.x, r4.y, r4.z
+-        ubfe r4.y, r4.z, CB0[0][0].z, r4.y
+-        if_z CB0[0][0].z
+-          ushr r5.yzw, r4.yyyy, l(0, 6, 3, 5)
+-          bfi r6.x, l(29), l(3), r5.y, r4.y
+-          ubfe r4.z, l(1), l(4), r4.y
+-          bfi r5.yz, l(0, 1, 1, 0), l(0, 1, 2, 0), r5.zzwz, l(0, 0, 0, 0)
+-          iadd r4.z, r4.z, r5.y
+-          iadd r6.y, r5.z, r4.z
+-        else 
+-          ieq r4.z, CB0[0][0].z, l(1)
+-          if_nz r4.z
+-            ushr r4.z, r4.y, l(5)
+-            bfi r4.z, l(1), l(3), r4.z, l(0)
+-            bfi r6.x, l(3), l(0), r4.y, r4.z
+-            ubfe r6.y, l(2), l(3), r4.y
+-          else 
+-            ushr r4.z, r4.y, l(2)
+-            bfi r4.z, l(1), l(1), r4.z, l(0)
+-            bfi r6.x, l(1), l(0), r4.y, r4.z
+-            ubfe r6.y, l(1), l(1), r4.y
+-          endif 
+-        endif 
+-        uge r4.y, CB0[0][0].z, l(3)
+-        iadd r4.z, -CB0[0][0].z, l(5)
+-        movc r4.y, r4.y, r4.z, l(4)
+-        umin r4.z, CB0[0][0].z, l(2)
+-        iadd r4.z, -r4.z, l(3)
+-        imad r5.yz, r6.xxyx, CB0[0][0].xxyx, r1.xxyx
+-        ushr r5.w, r5.y, r4.y
+-        ushr r6.x, r5.z, r4.z
+-        imad r5.w, r5.w, CB0[0][0].y, r6.x
+-        iadd r6.x, r4.y, CB0[0][0].z
+-        iadd r6.y, r4.z, r6.x
+-        ishl r5.w, r5.w, r6.y
+-        bfi r4.z, r4.z, r6.x, r5.z, l(0)
+-        or r4.z, r4.z, r5.w
+-        bfi r4.y, r4.y, CB0[0][0].z, r5.y, l(0)
+-        or r4.y, r4.y, r4.z
+-        imul null, r4.z, r0.x, r4.w
+-        imad r4.z, r5.x, r4.z, r0.z
+-        iadd r4.y, r4.y, r4.z
+-        and r4.z, r4.y, l(-4)
+-        ld_raw r4.z, r4.z, T0[0].xxxx
+-        bfi r4.y, l(2), l(3), r4.y, l(0)
+-        ushr r4.y, r4.z, r4.y
+-        bfi r4.x, r3.z, r4.x, r4.y, l(0)
+-        or r2.w, r2.w, r4.x
+-        iadd r3.w, r3.w, l(1)
++        uge r3.z, r2.w, r2.z
++        breakc_nz r3.z
++        imul null, r3.z, r3.y, r2.w
++        imad r3.w, r2.w, r3.x, r1.w
++        movc r4.x, CB0[0][0].z, l(4), l(3)
++        iadd r4.y, r4.x, -CB0[0][0].z
++        bfi r4.z, r4.x, l(0), l(0), r3.w
++        ubfe r3.w, r4.x, CB0[0][0].z, r3.w
++        imad r3.w, r3.w, CB0[0][0].x, r1.x
++        ushr r4.w, r3.w, r4.y
++        imad r4.w, r4.w, CB0[0][0].y, r1.y
++        bfi r3.w, r4.y, CB0[0][0].z, r3.w, l(0)
++        imad r4.y, r4.z, r0.x, r0.z
++        ishl r4.x, r4.w, r4.x
++        iadd r4.x, r4.x, r4.y
++        iadd r3.w, r3.w, r4.x
++        and r4.x, r3.w, l(-4)
++        ld_raw r4.x, r4.x, T0[0].xxxx
++        bfi r3.w, l(2), l(3), r3.w, l(0)
++        ushr r3.w, r4.x, r3.w
++        bfi r3.z, r3.y, r3.z, r3.w, l(0)
++        or r2.y, r2.y, r3.z
++        iadd r2.w, r2.w, l(1)
+       endloop 
+     endif 
+   endif 
+-  store_raw U0[0].x, r2.z, r2.w
+-  iadd r2.x, r2.x, l(128)
++  store_raw U0[0].x, r2.x, r2.y
++  iadd r1.z, r1.z, l(128)
+ endloop 
+ ret 
+-// Approximately 127 instruction slots used
++// Approximately 87 instruction slots used
+ #endif
+ 
+ const BYTE resolve_downscale_cs[] =
+ {
+-     68,  88,  66,  67,  64, 215, 
+-    227, 169, 171, 242,  93,  33, 
+-    124,  47,  95,  42, 121,  63, 
+-     97, 179,   1,   0,   0,   0, 
+-    136,  19,   0,   0,   5,   0, 
++     68,  88,  66,  67, 231, 221, 
++    166, 116,  74,  26,  30,  67, 
++    172,  26,  50,   9,  43,   3, 
++    241,   7,   1,   0,   0,   0, 
++    200,  13,   0,   0,   5,   0, 
+       0,   0,  52,   0,   0,   0, 
+     228,   2,   0,   0, 244,   2, 
+       0,   0,   4,   3,   0,   0, 
+-    236,  18,   0,   0,  82,  68, 
++     44,  13,   0,   0,  82,  68, 
+      69,  70, 168,   2,   0,   0, 
+       1,   0,   0,   0, 244,   0, 
+       0,   0,   3,   0,   0,   0, 
+@@ -308,8 +268,8 @@ const BYTE resolve_downscale_cs[] =
+      79,  83,  71,  78,   8,   0, 
+       0,   0,   0,   0,   0,   0, 
+       8,   0,   0,   0,  83,  72, 
+-     69,  88, 224,  15,   0,   0, 
+-     81,   0,   5,   0, 248,   3, 
++     69,  88,  32,  10,   0,   0, 
++     81,   0,   5,   0, 136,   2, 
+       0,   0, 106,   8,   0,   1, 
+      89,   0,   0,   7,  70, 142, 
+      48,   0,   0,   0,   0,   0, 
+@@ -327,7 +287,7 @@ const BYTE resolve_downscale_cs[] =
+       0,   2,   0,  64,   2,   0, 
+      95,   0,   0,   2,  18,  16, 
+       2,   0, 104,   0,   0,   2, 
+-      7,   0,   0,   0, 155,   0, 
++      5,   0,   0,   0, 155,   0, 
+       0,   4, 128,   0,   0,   0, 
+       1,   0,   0,   0,   1,   0, 
+       0,   0,  80,   0,   0,   8, 
+@@ -399,610 +359,363 @@ const BYTE resolve_downscale_cs[] =
+       0,   0,  66,   0,  16,   0, 
+       0,   0,   0,   0,  42,   0, 
+      16,   0,   0,   0,   0,   0, 
+-     10,  16,   2,   0,  41,   0, 
+-      0,  10, 194,   0,  16,   0, 
+-      1,   0,   0,   0,   6,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      7,   0,   0,   0,   6,   0, 
+-      0,   0,  54,   0,   0,   4, 
+-     18,   0,  16,   0,   2,   0, 
+-      0,   0,  10,  64,   2,   0, 
+-     48,   0,   0,   1,  80,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      2,   0,   0,   0,  10,   0, 
+-     16,   0,   2,   0,   0,   0, 
+-     58,   0,  16,   0,   0,   0, 
+-      0,   0,   3,   0,   4,   3, 
+-     26,   0,  16,   0,   2,   0, 
+-      0,   0,  41,   0,   0,   7, 
+-     34,   0,  16,   0,   2,   0, 
+-      0,   0,  10,   0,  16,   0, 
+-      2,   0,   0,   0,   1,  64, 
+-      0,   0,   2,   0,   0,   0, 
+-     35,   0,   0,   8,  66,   0, 
+-     16,   0,   2,   0,   0,   0, 
+-     10,  16,   2,   0,  26,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-     26,   0,  16,   0,   2,   0, 
+-      0,   0,  32,   0,   0,   9, 
+-    130,   0,  16,   0,   2,   0, 
+-      0,   0,  42, 128,  48,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
++     10,  16,   2,   0,  54,   0, 
++      0,   4,  66,   0,  16,   0, 
++      1,   0,   0,   0,  10,  64, 
++      2,   0,  48,   0,   0,   1, 
++     80,   0,   0,   7, 130,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,  58,   0,  16,   0, 
++      0,   0,   0,   0,   3,   0, 
++      4,   3,  58,   0,  16,   0, 
++      1,   0,   0,   0,  41,   0, 
++      0,   7, 130,   0,  16,   0, 
++      1,   0,   0,   0,  42,   0, 
++     16,   0,   1,   0,   0,   0, 
+       1,  64,   0,   0,   2,   0, 
+-      0,   0,  31,   0,   4,   3, 
+-     58,   0,  16,   0,   2,   0, 
+-      0,   0, 138,   0,   0,  15, 
+-     50,   0,  16,   0,   3,   0, 
+-      0,   0,   2,  64,   0,   0, 
+-     25,   0,   0,   0,  30,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   2,  64, 
+-      0,   0,   5,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
++      0,   0,  35,   0,   0,   8, 
++     18,   0,  16,   0,   2,   0, 
++      0,   0,  10,  16,   2,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  32,   0, 
++      0,   9,  34,   0,  16,   0, 
++      2,   0,   0,   0,  42, 128, 
++     48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      6,   0,  16,   0,   2,   0, 
+-      0,   0,   1,   0,   0,   7, 
+-    130,   0,  16,   0,   2,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      3,   0,   0,   0,   1,  64, 
+-      0,   0,  31,   0,   0,   0, 
+-    138,   0,   0,   9,  66,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-      1,  64,   0,   0,   2,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      3,   0,   0,   0,  26,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-    140,   0,   0,  11,  18,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-      1,  64,   0,   0,  30,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      2,   0,   0,   0,  42,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-     26,   0,  16,   0,   3,   0, 
+-      0,   0, 138,   0,   0,   9, 
+-     34,   0,  16,   0,   4,   0, 
++      2,   0,   0,   0,  31,   0, 
++      4,   3,  26,   0,  16,   0, 
++      2,   0,   0,   0,   1,   0, 
++      0,   7,  34,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0, 240, 255, 
++    255, 255, 138,   0,   0,   9, 
++     66,   0,  16,   0,   2,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      1,   0,   0,   0,   1,  64, 
++      2,   0,   0,   0,   1,  64, 
+       0,   0,   2,   0,   0,   0, 
+-     58,   0,  16,   0,   2,   0, 
++     58,   0,  16,   0,   1,   0, 
+       0,   0,  35,   0,   0,  11, 
+-     98,   0,  16,   0,   3,   0, 
+-      0,   0,  86,   4,  16,   0, 
+-      4,   0,   0,   0,  86, 132, 
++     66,   0,  16,   0,   2,   0, 
++      0,   0,  42,   0,  16,   0, 
++      2,   0,   0,   0,  10, 128, 
+      48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,  86,   4,  16,   0, 
++      0,   0,  10,   0,  16,   0, 
+       1,   0,   0,   0,  85,   0, 
+-      0,  10,  50,   0,  16,   0, 
+-      4,   0,   0,   0, 102,  10, 
+-     16,   0,   3,   0,   0,   0, 
+-      2,  64,   0,   0,   4,   0, 
+-      0,   0,   1,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
++      0,   7, 130,   0,  16,   0, 
++      2,   0,   0,   0,  42,   0, 
++     16,   0,   2,   0,   0,   0, 
++      1,  64,   0,   0,   2,   0, 
+       0,   0,  35,   0,   0,  11, 
+     130,   0,  16,   0,   2,   0, 
+-      0,   0,  10,   0,  16,   0, 
+-      4,   0,   0,   0,  26, 128, 
++      0,   0,  58,   0,  16,   0, 
++      2,   0,   0,   0,  26, 128, 
+      48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0, 140,   0, 
+-      0,  20,  98,   0,  16,   0, 
+-      3,   0,   0,   0,   2,  64, 
+-      0,   0,   0,   0,   0,   0, 
+-      1,   0,   0,   0,   4,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   6,   0,   0,   0, 
+-      2,   0,   0,   0,   0,   0, 
+-      0,   0,  86,   6,  16,   0, 
+-      3,   0,   0,   0,   2,  64, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0, 140,   0, 
++      0,  11,  66,   0,  16,   0, 
++      2,   0,   0,   0,   1,  64, 
++      0,   0,   2,   0,   0,   0, 
++      1,  64,   0,   0,   2,   0, 
++      0,   0,  42,   0,  16,   0, 
++      2,   0,   0,   0,   1,  64, 
+       0,   0,   0,   0,   0,   0, 
+-    140,   0,   0,  11, 130,   0, 
++     35,   0,   0,   9,  34,   0, 
+      16,   0,   2,   0,   0,   0, 
+-      1,  64,   0,   0,  25,   0, 
++     26,   0,  16,   0,   2,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,  42,   0, 
++     16,   0,   0,   0,   0,   0, 
++     41,   0,   0,   7, 130,   0, 
++     16,   0,   2,   0,   0,   0, 
++     58,   0,  16,   0,   2,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      7,   0,   0,   0,  58,   0, 
++      4,   0,   0,   0,  30,   0, 
++      0,   7,  34,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
+      16,   0,   2,   0,   0,   0, 
+-     26,   0,  16,   0,   3,   0, 
++     26,   0,  16,   0,   2,   0, 
+       0,   0,  30,   0,   0,   7, 
+-    130,   0,  16,   0,   2,   0, 
+-      0,   0,  58,   0,  16,   0, 
+-      2,   0,   0,   0,  42,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-     35,   0,   0,   9,  18,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-     10,   0,  16,   0,   3,   0, 
++     34,   0,  16,   0,   2,   0, 
+       0,   0,  42,   0,  16,   0, 
+-      1,   0,   0,   0,  42,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-     30,   0,   0,   7, 130,   0, 
++      2,   0,   0,   0,  26,   0, 
+      16,   0,   2,   0,   0,   0, 
+-     58,   0,  16,   0,   2,   0, 
+-      0,   0,  10,   0,  16,   0, 
+-      3,   0,   0,   0, 165,   0, 
+-      0,   8, 130,   0,  16,   0, 
+-      2,   0,   0,   0,  58,   0, 
++    165,   0,   0,   8,  34,   0, 
+      16,   0,   2,   0,   0,   0, 
+-      6, 112,  32,   0,   0,   0, 
++     26,   0,  16,   0,   2,   0, 
++      0,   0,   6, 112,  32,   0, 
+       0,   0,   0,   0,   0,   0, 
+-     18,   0,   0,   1,  32,   0, 
+-      0,   9,  18,   0,  16,   0, 
+-      3,   0,   0,   0,  42, 128, 
+-     48,   0,   0,   0,   0,   0, 
++      0,   0,  18,   0,   0,   1, 
++     32,   0,   0,   9,  66,   0, 
++     16,   0,   2,   0,   0,   0, 
++     42, 128,  48,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   3,   0,   0,   0, 
++     31,   0,   4,   3,  42,   0, 
++     16,   0,   2,   0,   0,   0, 
++      1,   0,   0,   7,  66,   0, 
++     16,   0,   2,   0,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      3,   0,   0,   0,  31,   0, 
+-      4,   3,  10,   0,  16,   0, 
+-      3,   0,   0,   0, 138,   0, 
+-      0,  15,  50,   0,  16,   0, 
+-      3,   0,   0,   0,   2,  64, 
+-      0,   0,  26,   0,   0,   0, 
+-     29,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      2,  64,   0,   0,   4,   0, 
++    240, 255, 255, 255, 138,   0, 
++      0,   9, 130,   0,  16,   0, 
++      2,   0,   0,   0,   1,  64, 
+       0,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   3,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  35,   0, 
++      0,  11, 130,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10, 128,  48,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   6,   0,  16,   0, 
+-      2,   0,   0,   0,   1,   0, 
+-      0,   7,  66,   0,  16,   0, 
+-      3,   0,   0,   0,  26,   0, 
++      0,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     85,   0,   0,   7,  18,   0, 
+      16,   0,   3,   0,   0,   0, 
+-      1,  64,   0,   0,   7,   0, 
+-      0,   0, 138,   0,   0,   9, 
+-    130,   0,  16,   0,   3,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      1,   0,   0,   0,   1,  64, 
+-      0,   0,   2,   0,   0,   0, 
+-     26,   0,  16,   0,   3,   0, 
+-      0,   0, 140,   0,   0,  11, 
+-     18,   0,  16,   0,   4,   0, 
++     58,   0,  16,   0,   2,   0, 
+       0,   0,   1,  64,   0,   0, 
+-     31,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-     58,   0,  16,   0,   3,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      3,   0,   0,   0, 138,   0, 
+-      0,   9,  34,   0,  16,   0, 
+-      4,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-      1,  64,   0,   0,   1,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      3,   0,   0,   0,  35,   0, 
+-      0,  11,  98,   0,  16,   0, 
+-      3,   0,   0,   0,  86,   4, 
+-     16,   0,   4,   0,   0,   0, 
+-     86, 132,  48,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  86,   4, 
+-     16,   0,   1,   0,   0,   0, 
+-     85,   0,   0,  10,  50,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-    102,  10,  16,   0,   3,   0, 
+-      0,   0,   2,  64,   0,   0, 
+-      2,   0,   0,   0,   1,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  35,   0, 
+-      0,  11, 130,   0,  16,   0, 
++      1,   0,   0,   0,  35,   0, 
++      0,  11,  18,   0,  16,   0, 
+       3,   0,   0,   0,  10,   0, 
+-     16,   0,   4,   0,   0,   0, 
++     16,   0,   3,   0,   0,   0, 
+      26, 128,  48,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,  26,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-    140,   0,   0,  20,  98,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   1,   0,   0,   0, 
+-      2,   0,   0,   0,   0,   0, 
+-      0,   0,   2,  64,   0,   0, 
+-      0,   0,   0,   0,   5,   0, 
+-      0,   0,   3,   0,   0,   0, 
+-      0,   0,   0,   0,  86,   6, 
+-     16,   0,   3,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0, 140,   0,   0,  11, 
+-     34,   0,  16,   0,   3,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-     26,   0,   0,   0,   1,  64, 
+-      0,   0,   6,   0,   0,   0, 
+-     58,   0,  16,   0,   3,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      3,   0,   0,   0,  30,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      3,   0,   0,   0,  26,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-     42,   0,  16,   0,   3,   0, 
+-      0,   0,  35,   0,   0,   9, 
+-     18,   0,  16,   0,   3,   0, 
+-      0,   0,  10,   0,  16,   0, 
+-      3,   0,   0,   0,  58,   0, 
+      16,   0,   1,   0,   0,   0, 
+-     42,   0,  16,   0,   0,   0, 
+-      0,   0,  30,   0,   0,   7, 
+-     18,   0,  16,   0,   3,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      3,   0,   0,   0,  10,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-    140,   0,   0,  11,  34,   0, 
+-     16,   0,   3,   0,   0,   0, 
++    140,   0,   0,  11, 130,   0, 
++     16,   0,   2,   0,   0,   0, 
+       1,  64,   0,   0,   1,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      2,   0,   0,   0,  10,   0, 
++      3,   0,   0,   0,  58,   0, 
+      16,   0,   2,   0,   0,   0, 
+       1,  64,   0,   0,   0,   0, 
+-      0,   0,  30,   0,   0,   7, 
++      0,   0,  35,   0,   0,   9, 
++     66,   0,  16,   0,   2,   0, 
++      0,   0,  42,   0,  16,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     42,   0,  16,   0,   0,   0, 
++      0,   0,  41,   0,   0,   7, 
+      18,   0,  16,   0,   3,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      3,   0,   0,   0,  10,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-    165,   0,   0,   8, 130,   0, 
++      0,   0,  10,   0,  16,   0, 
++      3,   0,   0,   0,   1,  64, 
++      0,   0,   4,   0,   0,   0, 
++     30,   0,   0,   7,  66,   0, 
+      16,   0,   2,   0,   0,   0, 
+-     10,   0,  16,   0,   3,   0, 
+-      0,   0,   6, 112,  32,   0, 
++     42,   0,  16,   0,   2,   0, 
++      0,   0,  10,   0,  16,   0, 
++      3,   0,   0,   0,  30,   0, 
++      0,   7,  66,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   2,   0,   0,   0, 
++     42,   0,  16,   0,   2,   0, 
++      0,   0, 140,   0,   0,  11, 
++    130,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   2,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0,  30,   0, 
++      0,   7,  66,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   2,   0,   0,   0, 
++     42,   0,  16,   0,   2,   0, 
++      0,   0, 165,   0,   0,   8, 
++     34,   0,  16,   0,   2,   0, 
++      0,   0,  42,   0,  16,   0, 
++      2,   0,   0,   0,   6, 112, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  18,   0, 
++      0,   1,  85,   0,   0,   9, 
++     66,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      4,   0,   0,   0,  42, 128, 
++     48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,  18,   0,   0,   1, 
+-     85,   0,   0,   9,  18,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-      1,  64,   0,   0,   4,   0, 
+-      0,   0,  42, 128,  48,   0, 
++      0,   0,  41,   0,   0,  12, 
++     50,   0,  16,   0,   3,   0, 
++      0,   0,   2,  64,   0,   0, 
++      1,   0,   0,   0,   8,   0, 
+       0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 166, 138, 
++     48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-     41,   0,   0,  12,  98,   0, 
+-     16,   0,   3,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   1,   0,   0,   0, 
+-      8,   0,   0,   0,   0,   0, 
+-      0,   0, 166, 138,  48,   0, 
++      0,   0,  54,   0,   0,   8, 
++    162,   0,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-     54,   0,   0,   5, 130,   0, 
+-     16,   0,   2,   0,   0,   0, 
+-      1,  64,   0,   0,   0,   0, 
+-      0,   0,  54,   0,   0,   5, 
+-    130,   0,  16,   0,   3,   0, 
+-      0,   0,   1,  64,   0,   0, 
+       0,   0,   0,   0,  48,   0, 
+       0,   1,  80,   0,   0,   7, 
+-     18,   0,  16,   0,   4,   0, 
++     66,   0,  16,   0,   3,   0, 
+       0,   0,  58,   0,  16,   0, 
+-      3,   0,   0,   0,  10,   0, 
++      2,   0,   0,   0,  42,   0, 
++     16,   0,   2,   0,   0,   0, 
++      3,   0,   4,   3,  42,   0, 
+      16,   0,   3,   0,   0,   0, 
+-      3,   0,   4,   3,  10,   0, 
+-     16,   0,   4,   0,   0,   0, 
+      38,   0,   0,   8,   0, 208, 
+-      0,   0,  18,   0,  16,   0, 
+-      4,   0,   0,   0,  42,   0, 
++      0,   0,  66,   0,  16,   0, 
++      3,   0,   0,   0,  26,   0, 
+      16,   0,   3,   0,   0,   0, 
+-     58,   0,  16,   0,   3,   0, 
++     58,   0,  16,   0,   2,   0, 
+       0,   0,  35,   0,   0,   9, 
+-     34,   0,  16,   0,   4,   0, 
++    130,   0,  16,   0,   3,   0, 
+       0,   0,  58,   0,  16,   0, 
+-      3,   0,   0,   0,  26,   0, 
++      2,   0,   0,   0,  10,   0, 
+      16,   0,   3,   0,   0,   0, 
+-     26,   0,  16,   0,   2,   0, 
+-      0,   0,  80,   0,   0,   9, 
+-     66,   0,  16,   0,   4,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      2,   0,   0,   0,  42, 128, 
+-     48,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,  55,   0,   0,  15, 
+-    194,   0,  16,   0,   4,   0, 
+-      0,   0, 166,  10,  16,   0, 
+-      4,   0,   0,   0,   2,  64, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,  55,   0,   0,  11, 
++     18,   0,  16,   0,   4,   0, 
++      0,   0,  42, 128,  48,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   7,   0, 
+-      0,   0, 128,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      6,   0,   0,   0,  64,   0, 
+-      0,   0,  85,   0,   0,   7, 
+-     18,   0,  16,   0,   5,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0,  42,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-    138,   0,   0,  11,  34,   0, 
++      1,  64,   0,   0,   4,   0, 
++      0,   0,   1,  64,   0,   0, 
++      3,   0,   0,   0,  30,   0, 
++      0,  10,  34,   0,  16,   0, 
++      4,   0,   0,   0,  10,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,  42, 128,  48,   0, 
++     42, 128,  48, 128,  65,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0,  31,   0,   0,   5, 
+-     42, 128,  48,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  85,   0, 
+-      0,  10, 226,   0,  16,   0, 
+-      5,   0,   0,   0,  86,   5, 
+-     16,   0,   4,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   6,   0,   0,   0, 
+-      3,   0,   0,   0,   5,   0, 
+       0,   0, 140,   0,   0,  11, 
+-     18,   0,  16,   0,   6,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-     29,   0,   0,   0,   1,  64, 
+-      0,   0,   3,   0,   0,   0, 
+-     26,   0,  16,   0,   5,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0, 138,   0, 
+-      0,   9,  66,   0,  16,   0, 
++     66,   0,  16,   0,   4,   0, 
++      0,   0,  10,   0,  16,   0, 
+       4,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-      1,  64,   0,   0,   4,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0, 140,   0, 
+-      0,  20,  98,   0,  16,   0, 
+-      5,   0,   0,   0,   2,  64, 
+-      0,   0,   0,   0,   0,   0, 
+-      1,   0,   0,   0,   1,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      2,  64,   0,   0,   0,   0, 
+-      0,   0,   1,   0,   0,   0, 
+-      2,   0,   0,   0,   0,   0, 
+-      0,   0, 166,  11,  16,   0, 
+-      5,   0,   0,   0,   2,  64, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-     30,   0,   0,   7,  66,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      5,   0,   0,   0,  30,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      6,   0,   0,   0,  42,   0, 
+-     16,   0,   5,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,  18,   0,   0,   1, 
+-     32,   0,   0,   9,  66,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      3,   0,   0,   0, 138,   0, 
++      0,  11, 130,   0,  16,   0, 
++      3,   0,   0,   0,  10,   0, 
+      16,   0,   4,   0,   0,   0, 
+      42, 128,  48,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-     31,   0,   4,   3,  42,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     85,   0,   0,   7,  66,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      5,   0,   0,   0, 140,   0, 
+-      0,  11,  66,   0,  16,   0, 
+-      4,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-      1,  64,   0,   0,   3,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      4,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,  58,   0, 
++     16,   0,   3,   0,   0,   0, 
++     35,   0,   0,  11, 130,   0, 
++     16,   0,   3,   0,   0,   0, 
++     58,   0,  16,   0,   3,   0, 
++      0,   0,  10, 128,  48,   0, 
+       0,   0,   0,   0,   0,   0, 
+-    140,   0,   0,  11,  18,   0, 
+-     16,   0,   6,   0,   0,   0, 
+-      1,  64,   0,   0,   3,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      0,   0,   0,   0,  26,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0, 138,   0,   0,   9, 
+-     34,   0,  16,   0,   6,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      2,   0,   0,   0,   1,  64, 
+-      0,   0,   3,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0,  18,   0,   0,   1, 
+-     85,   0,   0,   7,  66,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      2,   0,   0,   0, 140,   0, 
+-      0,  11,  66,   0,  16,   0, 
+-      4,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-      1,  64,   0,   0,   1,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      4,   0,   0,   0,   1,  64, 
+       0,   0,   0,   0,   0,   0, 
+-    140,   0,   0,  11,  18,   0, 
+-     16,   0,   6,   0,   0,   0, 
+-      1,  64,   0,   0,   1,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      0,   0,   0,   0,  26,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,  85,   0,   0,   7, 
++    130,   0,  16,   0,   4,   0, 
++      0,   0,  58,   0,  16,   0, 
++      3,   0,   0,   0,  26,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0, 138,   0,   0,   9, 
+-     34,   0,  16,   0,   6,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      1,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0,  21,   0,   0,   1, 
+-     21,   0,   0,   1,  80,   0, 
+-      0,   9,  34,   0,  16,   0, 
+-      4,   0,   0,   0,  42, 128, 
+-     48,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      3,   0,   0,   0,  30,   0, 
+-      0,  10,  66,   0,  16,   0, 
+-      4,   0,   0,   0,  42, 128, 
+-     48, 128,  65,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      1,  64,   0,   0,   5,   0, 
+-      0,   0,  55,   0,   0,   9, 
+-     34,   0,  16,   0,   4,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0,  42,   0, 
++     35,   0,   0,  11, 130,   0, 
+      16,   0,   4,   0,   0,   0, 
+-      1,  64,   0,   0,   4,   0, 
+-      0,   0,  84,   0,   0,   9, 
+-     66,   0,  16,   0,   4,   0, 
+-      0,   0,  42, 128,  48,   0, 
++     58,   0,  16,   0,   4,   0, 
++      0,   0,  26, 128,  48,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      1,  64,   0,   0,   2,   0, 
+-      0,   0,  30,   0,   0,   8, 
+-     66,   0,  16,   0,   4,   0, 
+-      0,   0,  42,   0,  16, 128, 
+-     65,   0,   0,   0,   4,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      3,   0,   0,   0,  35,   0, 
+-      0,  11,  98,   0,  16,   0, 
+-      5,   0,   0,   0,   6,   1, 
+-     16,   0,   6,   0,   0,   0, 
+-      6, 129,  48,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   6,   1, 
+-     16,   0,   1,   0,   0,   0, 
+-     85,   0,   0,   7, 130,   0, 
+-     16,   0,   5,   0,   0,   0, 
+-     26,   0,  16,   0,   5,   0, 
++     26,   0,  16,   0,   1,   0, 
++      0,   0, 140,   0,   0,  13, 
++    130,   0,  16,   0,   3,   0, 
+       0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0,  85,   0, 
+-      0,   7,  18,   0,  16,   0, 
+-      6,   0,   0,   0,  42,   0, 
+-     16,   0,   5,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,  35,   0,   0,  11, 
+-    130,   0,  16,   0,   5,   0, 
+-      0,   0,  58,   0,  16,   0, 
+-      5,   0,   0,   0,  26, 128, 
++      4,   0,   0,   0,  42, 128, 
+      48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,  10,   0,  16,   0, 
+-      6,   0,   0,   0,  30,   0, 
+-      0,   9,  18,   0,  16,   0, 
+-      6,   0,   0,   0,  26,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     42, 128,  48,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  30,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      6,   0,   0,   0,  42,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     10,   0,  16,   0,   6,   0, 
+-      0,   0,  41,   0,   0,   7, 
+-    130,   0,  16,   0,   5,   0, 
+       0,   0,  58,   0,  16,   0, 
+-      5,   0,   0,   0,  26,   0, 
+-     16,   0,   6,   0,   0,   0, 
+-    140,   0,   0,  11,  66,   0, 
++      3,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,   0, 
++     35,   0,   0,   9,  34,   0, 
+      16,   0,   4,   0,   0,   0, 
+      42,   0,  16,   0,   4,   0, 
+       0,   0,  10,   0,  16,   0, 
+-      6,   0,   0,   0,  42,   0, 
+-     16,   0,   5,   0,   0,   0, 
+-      1,  64,   0,   0,   0,   0, 
+-      0,   0,  60,   0,   0,   7, 
+-     66,   0,  16,   0,   4,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      4,   0,   0,   0,  58,   0, 
+-     16,   0,   5,   0,   0,   0, 
+-    140,   0,   0,  13,  34,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0,  42, 128,  48,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-     26,   0,  16,   0,   5,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      0,   0,   0,   0,  60,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      4,   0,   0,   0,  26,   0, 
++      0,   0,   0,   0,  42,   0, 
++     16,   0,   0,   0,   0,   0, 
++     41,   0,   0,   7,  18,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,  38,   0,   0,   8, 
+-      0, 208,   0,   0,  66,   0, 
++     58,   0,  16,   0,   4,   0, 
++      0,   0,  10,   0,  16,   0, 
++      4,   0,   0,   0,  30,   0, 
++      0,   7,  18,   0,  16,   0, 
++      4,   0,   0,   0,  10,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     10,   0,  16,   0,   0,   0, 
++     26,   0,  16,   0,   4,   0, 
++      0,   0,  30,   0,   0,   7, 
++    130,   0,  16,   0,   3,   0, 
+       0,   0,  58,   0,  16,   0, 
+-      4,   0,   0,   0,  35,   0, 
+-      0,   9,  66,   0,  16,   0, 
+-      4,   0,   0,   0,  10,   0, 
+-     16,   0,   5,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      0,   0,   0,   0,  30,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      4,   0,   0,   0,  26,   0, 
++      3,   0,   0,   0,  10,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,   1,   0,   0,   7, 
+-     66,   0,  16,   0,   4,   0, 
+-      0,   0,  26,   0,  16,   0, 
+-      4,   0,   0,   0,   1,  64, 
+-      0,   0, 252, 255, 255, 255, 
+-    165,   0,   0,   8,  66,   0, 
++      1,   0,   0,   7,  18,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     42,   0,  16,   0,   4,   0, 
+-      0,   0,   6, 112,  32,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0, 140,   0,   0,  11, 
+-     34,   0,  16,   0,   4,   0, 
+-      0,   0,   1,  64,   0,   0, 
+-      2,   0,   0,   0,   1,  64, 
+-      0,   0,   3,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
++     58,   0,  16,   0,   3,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      0,   0,   0,   0,  85,   0, 
+-      0,   7,  34,   0,  16,   0, 
+-      4,   0,   0,   0,  42,   0, 
+-     16,   0,   4,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
+-      0,   0, 140,   0,   0,  11, 
+-     18,   0,  16,   0,   4,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      3,   0,   0,   0,  10,   0, 
++    252, 255, 255, 255, 165,   0, 
++      0,   8,  18,   0,  16,   0, 
++      4,   0,   0,   0,  10,   0, 
+      16,   0,   4,   0,   0,   0, 
+-     26,   0,  16,   0,   4,   0, 
++      6, 112,  32,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    140,   0,   0,  11, 130,   0, 
++     16,   0,   3,   0,   0,   0, 
++      1,  64,   0,   0,   2,   0, 
+       0,   0,   1,  64,   0,   0, 
+-      0,   0,   0,   0,  60,   0, 
+-      0,   7, 130,   0,  16,   0, 
+-      2,   0,   0,   0,  58,   0, 
+-     16,   0,   2,   0,   0,   0, 
+-     10,   0,  16,   0,   4,   0, 
+-      0,   0,  30,   0,   0,   7, 
++      3,   0,   0,   0,  58,   0, 
++     16,   0,   3,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  85,   0,   0,   7, 
+     130,   0,  16,   0,   3,   0, 
+-      0,   0,  58,   0,  16,   0, 
+-      3,   0,   0,   0,   1,  64, 
+-      0,   0,   1,   0,   0,   0, 
+-     22,   0,   0,   1,  21,   0, 
+-      0,   1,  21,   0,   0,   1, 
+-    166,   0,   0,   8,  18, 224, 
+-     33,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  42,   0, 
++      0,   0,  10,   0,  16,   0, 
++      4,   0,   0,   0,  58,   0, 
++     16,   0,   3,   0,   0,   0, 
++    140,   0,   0,  11,  66,   0, 
++     16,   0,   3,   0,   0,   0, 
++     26,   0,  16,   0,   3,   0, 
++      0,   0,  42,   0,  16,   0, 
++      3,   0,   0,   0,  58,   0, 
++     16,   0,   3,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  60,   0,   0,   7, 
++     34,   0,  16,   0,   2,   0, 
++      0,   0,  26,   0,  16,   0, 
++      2,   0,   0,   0,  42,   0, 
++     16,   0,   3,   0,   0,   0, 
++     30,   0,   0,   7, 130,   0, 
+      16,   0,   2,   0,   0,   0, 
+      58,   0,  16,   0,   2,   0, 
+-      0,   0,  30,   0,   0,   7, 
+-     18,   0,  16,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      1,   0,   0,   0,  22,   0, 
++      0,   1,  21,   0,   0,   1, 
++     21,   0,   0,   1, 166,   0, 
++      0,   8,  18, 224,  33,   0, 
++      0,   0,   0,   0,   0,   0, 
+       0,   0,  10,   0,  16,   0, 
+-      2,   0,   0,   0,   1,  64, 
+-      0,   0, 128,   0,   0,   0, 
+-     22,   0,   0,   1,  62,   0, 
+-      0,   1,  83,  84,  65,  84, 
+-    148,   0,   0,   0, 127,   0, 
+-      0,   0,   7,   0,   0,   0, 
+-      0,   0,   0,   0,   2,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-     39,   0,   0,   0,  26,   0, 
+-      0,   0,   8,   0,   0,   0, 
+-      7,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,  26,   0, 
++     16,   0,   2,   0,   0,   0, 
++     30,   0,   0,   7,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++    128,   0,   0,   0,  22,   0, 
++      0,   1,  62,   0,   0,   1, 
++     83,  84,  65,  84, 148,   0, 
++      0,   0,  87,   0,   0,   0, 
++      5,   0,   0,   0,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,  34,   0, 
++      0,   0,  16,   0,   0,   0, 
++      5,   0,   0,   0,   6,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   3,   0, 
+       0,   0,   0,   0,   0,   0, 
++      0,   0,   3,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   4,   0,   0,   0, 
+-      2,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
++      3,   0,   0,   0,   1,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+@@ -1011,6 +724,7 @@ const BYTE resolve_downscale_cs[] =
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   1,   0, 
+-      0,   0
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0
+ };
+diff --git a/src/graphics/shaders/resolve_downscale.cs.hlsl b/src/graphics/shaders/resolve_downscale.cs.hlsl
+index e921872ee4c86fbc208d519852af65245a93d1de..876e447e583454e94738b5a9c62a25ea046c5dea 100644
+--- a/src/graphics/shaders/resolve_downscale.cs.hlsl
++++ b/src/graphics/shaders/resolve_downscale.cs.hlsl
+@@ -61,57 +61,32 @@ RWByteAddressBuffer xe_resolve_dest : register(u0);
+ #define xe_downscale_source_offset_bytes 0u
+ #endif
+ 
+-// Scaled-buffer byte of the chosen supersample of the 1x block at tiled,
+-// tile-relative offset tile_rel_bytes. Callers add the intra-block offset.
++// Scaled-buffer byte of the chosen supersample of the 1x texel at tiled,
++// tile-relative offset tile_rel_bytes. Callers add the intra-texel offset.
++//
++// FM3 research build: the resolve shaders of this SDK (resolve_*_scaled_cs)
++// do not use the group packing the xenia-edge port assumed. Decoded from
++// their bytecode (and described in pipeline/texture/cache.h): scaling is done
++// per "portion" of guest memory - 8 bytes for 8bpp, 16 bytes otherwise, the
++// runs that are contiguous along X in a tiled texture. A portion of T texels
++// becomes scale_x * scale_y host chunks of the same size, stored X-major:
++//   scaled = portion_offset * scale_x * scale_y
++//          + ((host_x / T) * scale_y + host_y) * portion_size
++//          + (host_x % T) * texel_size
++// with host_x = texel_in_portion * scale_x + sample_x, host_y = sample_y.
+ uint XeDownscaleScaledBlockByte(uint tile_src_base, uint tile_rel_bytes,
+                                 uint pixel_size_log2, uint scale_x, uint scale_y,
+                                 uint sample_x, uint sample_y) {
+-  // A guest group spans the low 7 tiled-address bits (6 for 64bpp).
+-  uint group_size_log2 = (pixel_size_log2 <= 2u) ? 7u : 6u;
+-  uint group_index = tile_rel_bytes >> group_size_log2;
+-  uint in_group = tile_rel_bytes & ((1u << group_size_log2) - 1u);
+-  uint block_index = in_group >> pixel_size_log2;
+-
+-  uint px;
+-  uint py;
+-  if (pixel_size_log2 == 0u) {
+-    // 1bpp, group 16x8: bits X0 X1 X2 Y1 Y0 Y2 X3.
+-    px = (block_index & 7u) | (((block_index >> 6u) & 1u) << 3u);
+-    py = ((block_index >> 4u) & 1u) | (((block_index >> 3u) & 1u) << 1u) |
+-         (((block_index >> 5u) & 1u) << 2u);
+-  } else if (pixel_size_log2 == 1u) {
+-    // 2bpp, group 16x4: bits X0 X1 X2 Y0 Y1 X3.
+-    px = (block_index & 7u) | (((block_index >> 5u) & 1u) << 3u);
+-    py = (block_index >> 3u) & 3u;
+-  } else if (pixel_size_log2 == 2u) {
+-    // 4bpp, group 16x2: bits X0 X1 Y0 X2 X3.
+-    px = (block_index & 3u) | (((block_index >> 3u) & 3u) << 2u);
+-    py = (block_index >> 2u) & 1u;
+-  } else {
+-    // 8bpp, group 4x2: bits X0 Y0 X1.
+-    px = (block_index & 1u) | (((block_index >> 2u) & 1u) << 1u);
+-    py = (block_index >> 1u) & 1u;
+-  }
+-
+-  // Group dimensions in blocks (XeniaTextureResolutionScaledGroupBlocksLog2).
+-  uint group_blocks_x_log2 = (pixel_size_log2 >= 3u) ? (5u - pixel_size_log2) : 4u;
+-  uint group_blocks_y_log2 = 3u - min(pixel_size_log2, 2u);
+-
+-  uint host_x = px * scale_x + sample_x;
+-  uint host_y = py * scale_y + sample_y;
+-  uint host_group_x = host_x >> group_blocks_x_log2;
+-  uint host_group_y = host_y >> group_blocks_y_log2;
+-  uint host_group_index = host_group_x * scale_y + host_group_y;
+-  uint pos_x = host_x & ((1u << group_blocks_x_log2) - 1u);
+-  uint pos_y = host_y & ((1u << group_blocks_y_log2) - 1u);
+-  uint group_width_bytes_log2 = group_blocks_x_log2 + pixel_size_log2;
+-
+-  uint scaled_in_group =
+-      (host_group_index << (group_width_bytes_log2 + group_blocks_y_log2)) |
+-      (pos_y << group_width_bytes_log2) | (pos_x << pixel_size_log2);
+-
+-  uint group_size_scaled = (1u << group_size_log2) * (scale_x * scale_y);
+-  return tile_src_base + group_index * group_size_scaled + scaled_in_group;
++  uint portion_log2 = (pixel_size_log2 == 0u) ? 3u : 4u;
++  uint portion_mask = (1u << portion_log2) - 1u;
++  uint texels_log2 = portion_log2 - pixel_size_log2;
++  uint portion_offset = tile_rel_bytes & ~portion_mask;
++  uint texel = (tile_rel_bytes & portion_mask) >> pixel_size_log2;
++  uint host_x = texel * scale_x + sample_x;
++  uint chunk = (host_x >> texels_log2) * scale_y + sample_y;
++  uint in_chunk = (host_x & ((1u << texels_log2) - 1u)) << pixel_size_log2;
++  return tile_src_base + portion_offset * (scale_x * scale_y) + (chunk << portion_log2) +
++         in_chunk;
+ }
+ 
+ // 128 threads per group; a tile has 256..2048 output dwords depending on the
